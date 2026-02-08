@@ -12,7 +12,7 @@
           version = "0.0.5";
           src = pkgs.fetchurl {
             url = "https://github.com/nakajima/releasor2000/releases/download/v0.0.5/releasor2000-0.0.5-x86_64-apple-darwin.tar.gz";
-            sha256 = "913298e6a38445fffc368230bf1473ff5b52d5ceb6d7725d41c8e61fa28ae527";
+            sha256 = "411aae9c8ff487d77e8284e5139194d415566c33a5d431504ebb45eacf461e91";
           };
           sourceRoot = ".";
           installPhase = ''
@@ -27,7 +27,7 @@
           version = "0.0.5";
           src = pkgs.fetchurl {
             url = "https://github.com/nakajima/releasor2000/releases/download/v0.0.5/releasor2000-0.0.5-aarch64-apple-darwin.tar.gz";
-            sha256 = "e6af5254e42a93bc97c7841f99b29a6c70125c5ca40af32102b39a17cd643e9e";
+            sha256 = "ec5eb7ddc125f5f6783ce058333f5d5dc0e350155256a9b77d436097f90d6509";
           };
           sourceRoot = ".";
           installPhase = ''
@@ -42,7 +42,7 @@
           version = "0.0.5";
           src = pkgs.fetchurl {
             url = "https://github.com/nakajima/releasor2000/releases/download/v0.0.5/releasor2000-0.0.5-x86_64-unknown-linux-gnu.tar.gz";
-            sha256 = "eadb9644d2db284a64d30eb9f10c1e994fbfd6fdbb857e7e6f539f92edded106";
+            sha256 = "43c776c1b873f74db3ba5d6279326ed9b74814e6c9a55aa4db06fa4b460cb85d";
           };
           sourceRoot = ".";
           installPhase = ''
@@ -57,7 +57,7 @@
           version = "0.0.5";
           src = pkgs.fetchurl {
             url = "https://github.com/nakajima/releasor2000/releases/download/v0.0.5/releasor2000-0.0.5-aarch64-unknown-linux-gnu.tar.gz";
-            sha256 = "e3b650c3a1c20300f044eb610562f2d3932249c543552afaa5c141d01d294952";
+            sha256 = "3c2831c4f6ec323d1412840dbb36fdb6932e6b9bfe69ac8b6caee9b68eb7f90e";
           };
           sourceRoot = ".";
           installPhase = ''
