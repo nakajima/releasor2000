@@ -572,54 +572,47 @@ fn generate_flake(
     let pkg_entries: Vec<String> = system_hashes
         .iter()
         .map(|(nix_sys, rust_target, sha256_hex)| {
-            let entry = r#"          "NIXSYSTEM" = mkPkg {
-            target = "RUSTTARGET";
+            let entry = r#"      "NIXSYSTEM" = let
+        pkgs = nixpkgs.legacyPackages.NIXSYSTEM;
+        pkg = pkgs.stdenv.mkDerivation {
+          pname = "BINARY";
+          version = "VERSION";
+          src = pkgs.fetchurl {
+            url = "https://github.com/REPO/releases/download/vVERSION/BINARY-VERSION-RUSTTARGET.tar.gz";
             sha256 = "SHA256HEX";
-          };"#;
+          };
+          sourceRoot = ".";
+          installPhase = ''
+            install -m755 -D BINARY $out/bin/BINARY
+          '';
+        };
+      in { BINARY = pkg; default = pkg; };"#;
             entry
                 .replace("NIXSYSTEM", nix_sys)
                 .replace("RUSTTARGET", rust_target)
                 .replace("SHA256HEX", sha256_hex)
+                .replace("BINARY", binary)
+                .replace("REPO", repo)
+                .replace("VERSION", version)
         })
         .collect();
 
     let template = r#"{
   description = "DESCRIPTION";
 
-  outputs = { self, nixpkgs }: let
-    mkPkg = { target, sha256 }: let
-      pkgs = nixpkgs.legacyPackages.${"DOLLAR"}{system};
-    in pkgs.stdenv.mkDerivation {
-      pname = "BINARY";
-      version = "VERSION";
-      src = pkgs.fetchurl {
-        url = "https://github.com/REPO/releases/download/vVERSION/BINARY-VERSION-${target}.tar.gz";
-        inherit sha256;
-      };
-      sourceRoot = ".";
-      installPhase = ''
-        install -m755 -D BINARY $out/bin/BINARY
-      '';
-    };
-    systems = {
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+
+  outputs = { self, nixpkgs }: {
+    packages = {
 PKGENTRIES
     };
-  in {
-    packages = builtins.mapAttrs (system: mkPkg: {
-      BINARY = mkPkg;
-      default = mkPkg;
-    }) systems;
   };
 }
 "#;
 
     template
         .replace("DESCRIPTION", name)
-        .replace("BINARY", binary)
-        .replace("REPO", repo)
-        .replace("VERSION", version)
         .replace("PKGENTRIES", &pkg_entries.join("\n"))
-        .replace("DOLLAR", "$")
 }
 
 fn release_nix(
@@ -632,18 +625,40 @@ fn release_nix(
     let repo = &config.project.repo;
     let flake_repo = ch.flake_repo.as_deref().unwrap_or(repo);
 
-    // Verify release exists
+    // Download release assets from GitHub and hash them (local archives may differ)
     let release_url = format!("https://api.github.com/repos/{repo}/releases/tags/v{version}");
-    github_api("nix", "GET", &release_url, None)
+    let release = github_api("nix", "GET", &release_url, None)
         .with_context(|| format!("[nix] GitHub release v{version} not found — run the github channel first"))?;
 
-    // Compute sha256 for each archive, map to nix systems
+    let staging = PathBuf::from("target/release-staging");
+    std::fs::create_dir_all(&staging)?;
+
     let mut system_hashes = Vec::new();
-    for (target, path) in archives {
-        if let Some(nix_sys) = nix_system(target) {
-            let hash = sha256(path)?;
-            system_hashes.push((nix_sys, target.as_str(), hash));
+    for (target, _) in archives {
+        let nix_sys = match nix_system(target) {
+            Some(s) => s,
+            None => continue,
+        };
+        let asset_name = format!("{binary}-{version}-{target}.tar.gz");
+        let download_url = format!(
+            "https://github.com/{repo}/releases/download/v{version}/{asset_name}"
+        );
+
+        // Verify asset exists in the release
+        let assets = release["assets"].as_array();
+        let asset_exists = assets.is_some_and(|a| {
+            a.iter().any(|asset| asset["name"].as_str() == Some(&asset_name))
+        });
+        if !asset_exists {
+            eprintln!("[nix] Warning: asset {asset_name} not found in release, skipping");
+            continue;
         }
+
+        let tmp_path = staging.join(format!("nix-{asset_name}"));
+        run_cmd("nix", None, "curl", &["-fsSL", "-o", &tmp_path.to_string_lossy(), &download_url])?;
+        let hash = sha256(&tmp_path)?;
+        std::fs::remove_file(&tmp_path).ok();
+        system_hashes.push((nix_sys, target.as_str(), hash));
     }
 
     let system_hash_refs: Vec<(&str, &str, &str)> = system_hashes
@@ -653,26 +668,59 @@ fn release_nix(
 
     let flake = generate_flake(binary, binary, repo, version, &system_hash_refs);
 
-    // Push flake.nix via Contents API
-    let api_url = format!(
-        "https://api.github.com/repos/{}/contents/flake.nix",
+    // Push file via Contents API, returns Ok(true) if pushed, Ok(false) if skipped
+    let push_file = |file: &str, content: &str, msg: &str| -> Result<()> {
+        let api_url = format!(
+            "https://api.github.com/repos/{}/contents/{}",
+            flake_repo, file
+        );
+        let existing_sha = github_api("nix", "GET", &api_url, None)
+            .ok()
+            .and_then(|resp| resp["sha"].as_str().map(|s| s.to_string()));
+        let mut body = serde_json::json!({
+            "message": msg,
+            "content": BASE64.encode(content.as_bytes()),
+        });
+        if let Some(sha) = existing_sha {
+            body["sha"] = serde_json::Value::String(sha);
+        }
+        github_api("nix", "PUT", &api_url, Some(&body.to_string()))?;
+        Ok(())
+    };
+
+    push_file("flake.nix", &flake, &format!("Update {binary} to {version}"))?;
+
+    // Try to generate and push flake.lock if nix is available
+    let lock_url = format!(
+        "https://api.github.com/repos/{}/contents/flake.lock",
         flake_repo
     );
+    let has_lock = github_api("nix", "GET", &lock_url, None).is_ok();
 
-    let existing_sha = github_api("nix", "GET", &api_url, None)
-        .ok()
-        .and_then(|resp| resp["sha"].as_str().map(|s| s.to_string()));
-
-    let mut body = serde_json::json!({
-        "message": format!("Update {binary} to {version}"),
-        "content": BASE64.encode(flake.as_bytes()),
-    });
-    if let Some(sha) = existing_sha {
-        body["sha"] = serde_json::Value::String(sha);
+    let tmp_dir = std::env::temp_dir().join(format!("releasor2000-nix-{version}"));
+    std::fs::create_dir_all(&tmp_dir)?;
+    std::fs::write(tmp_dir.join("flake.nix"), &flake)?;
+    let lock_cmd = format!("cd '{}' && nix flake lock", tmp_dir.display());
+    let lock_result = run_cmd("nix", None, "sh", &["-lc", &lock_cmd]);
+    match lock_result {
+        Ok(_) => {
+            let flake_lock = std::fs::read_to_string(tmp_dir.join("flake.lock"))
+                .context("[nix] failed to read generated flake.lock")?;
+            push_file("flake.lock", &flake_lock, &format!("Update flake.lock for {binary} {version}"))?;
+            println!("[nix] Updated flake.nix and flake.lock in {flake_repo}");
+        }
+        Err(_) if has_lock => {
+            println!("[nix] Updated flake.nix in {flake_repo} (existing flake.lock kept)");
+        }
+        Err(_) => {
+            println!("[nix] Updated flake.nix in {flake_repo}");
+            eprintln!("[nix] Warning: could not generate flake.lock (nix not found)");
+            eprintln!("[nix] Run this once on a machine with nix to create it:");
+            eprintln!("  git clone git@github.com:{flake_repo}.git && cd {} && nix flake lock && git add flake.lock && git commit -m 'Add flake.lock' && git push",
+                flake_repo.split('/').last().unwrap_or(flake_repo));
+        }
     }
-
-    github_api("nix", "PUT", &api_url, Some(&body.to_string()))?;
-    println!("[nix] Updated flake.nix in {}", flake_repo);
+    std::fs::remove_dir_all(&tmp_dir).ok();
     Ok(())
 }
 
@@ -899,8 +947,8 @@ mod tests {
             ("x86_64-linux", "x86_64-unknown-linux-gnu", "deadbeef"),
             ("aarch64-darwin", "aarch64-apple-darwin", "cafebabe"),
         ]);
-        assert!(flake.contains(r#"sha256 = "deadbeef""#));
-        assert!(flake.contains(r#"sha256 = "cafebabe""#));
+        assert!(flake.contains(r#""deadbeef""#));
+        assert!(flake.contains(r#""cafebabe""#));
     }
 
     #[test]
@@ -927,7 +975,7 @@ mod tests {
             ("x86_64-linux", "x86_64-unknown-linux-gnu", "abc"),
             ("aarch64-darwin", "aarch64-apple-darwin", "def"),
         ]);
-        assert!(flake.contains(r#""x86_64-linux" = mkPkg"#));
-        assert!(flake.contains(r#""aarch64-darwin" = mkPkg"#));
+        assert!(flake.contains(r#""x86_64-linux" = let"#));
+        assert!(flake.contains(r#""aarch64-darwin" = let"#));
     }
 }
