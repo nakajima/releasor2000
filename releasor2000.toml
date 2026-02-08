@@ -27,4 +27,4 @@ crate_name = "releasor2000"
 # [channels.curl]
 
 # [channels.nix]
-# flake_repo = "owner/nix-repo"
+# flake_repo = "owner/nix-repo" # defaults to project repo

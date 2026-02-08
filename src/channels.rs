@@ -359,7 +359,7 @@ pub fn release(config: &Config, version_override: Option<&str>, channels: Option
             "homebrew" => release_homebrew(config, &version, &archives)?,
             "cargo" => release_cargo(config)?,
             "curl" => release_curl(config, &version)?,
-            "nix" => release_nix(config, &version)?,
+            "nix" => release_nix(config, &version, &archives)?,
             _ => unreachable!(),
         }
     }
@@ -548,27 +548,131 @@ echo "Installed $BINARY to $INSTALL_DIR/$BINARY"
     )
 }
 
-fn release_nix(config: &Config, version: &str) -> Result<()> {
+fn nix_system(target: &str) -> Option<&'static str> {
+    if target.contains("x86_64") && target.contains("linux") {
+        Some("x86_64-linux")
+    } else if target.contains("aarch64") && target.contains("linux") {
+        Some("aarch64-linux")
+    } else if target.contains("x86_64") && target.contains("darwin") {
+        Some("x86_64-darwin")
+    } else if target.contains("aarch64") && target.contains("darwin") {
+        Some("aarch64-darwin")
+    } else {
+        None
+    }
+}
+
+fn generate_flake(
+    name: &str,
+    binary: &str,
+    repo: &str,
+    version: &str,
+    system_hashes: &[(&str, &str, &str)],
+) -> String {
+    let pkg_entries: Vec<String> = system_hashes
+        .iter()
+        .map(|(nix_sys, rust_target, sha256_hex)| {
+            let entry = r#"          "NIXSYSTEM" = mkPkg {
+            target = "RUSTTARGET";
+            sha256 = "SHA256HEX";
+          };"#;
+            entry
+                .replace("NIXSYSTEM", nix_sys)
+                .replace("RUSTTARGET", rust_target)
+                .replace("SHA256HEX", sha256_hex)
+        })
+        .collect();
+
+    let template = r#"{
+  description = "DESCRIPTION";
+
+  outputs = { self, nixpkgs }: let
+    mkPkg = { target, sha256 }: let
+      pkgs = nixpkgs.legacyPackages.${"DOLLAR"}{system};
+    in pkgs.stdenv.mkDerivation {
+      pname = "BINARY";
+      version = "VERSION";
+      src = pkgs.fetchurl {
+        url = "https://github.com/REPO/releases/download/vVERSION/BINARY-VERSION-${target}.tar.gz";
+        inherit sha256;
+      };
+      sourceRoot = ".";
+      installPhase = ''
+        install -m755 -D BINARY $out/bin/BINARY
+      '';
+    };
+    systems = {
+PKGENTRIES
+    };
+  in {
+    packages = builtins.mapAttrs (system: mkPkg: {
+      BINARY = mkPkg;
+      default = mkPkg;
+    }) systems;
+  };
+}
+"#;
+
+    template
+        .replace("DESCRIPTION", name)
+        .replace("BINARY", binary)
+        .replace("REPO", repo)
+        .replace("VERSION", version)
+        .replace("PKGENTRIES", &pkg_entries.join("\n"))
+        .replace("DOLLAR", "$")
+}
+
+fn release_nix(
+    config: &Config,
+    version: &str,
+    archives: &[(String, PathBuf)],
+) -> Result<()> {
     let ch = config.channels.nix.as_ref().unwrap();
+    let binary = config.project.binary();
     let repo = &config.project.repo;
+    let flake_repo = ch.flake_repo.as_deref().unwrap_or(repo);
 
-    let source_url = format!(
-        "https://github.com/{repo}/archive/refs/tags/v{version}.tar.gz"
+    // Verify release exists
+    let release_url = format!("https://api.github.com/repos/{repo}/releases/tags/v{version}");
+    github_api("nix", "GET", &release_url, None)
+        .with_context(|| format!("[nix] GitHub release v{version} not found — run the github channel first"))?;
+
+    // Compute sha256 for each archive, map to nix systems
+    let mut system_hashes = Vec::new();
+    for (target, path) in archives {
+        if let Some(nix_sys) = nix_system(target) {
+            let hash = sha256(path)?;
+            system_hashes.push((nix_sys, target.as_str(), hash));
+        }
+    }
+
+    let system_hash_refs: Vec<(&str, &str, &str)> = system_hashes
+        .iter()
+        .map(|(s, t, h)| (*s, *t, h.as_str()))
+        .collect();
+
+    let flake = generate_flake(binary, binary, repo, version, &system_hash_refs);
+
+    // Push flake.nix via Contents API
+    let api_url = format!(
+        "https://api.github.com/repos/{}/contents/flake.nix",
+        flake_repo
     );
-    let hash = run_cmd(
-        "nix",
-        None,
-        "nix-prefetch-url",
-        &["--unpack", &source_url],
-    )?;
 
-    let url = format!("https://api.github.com/repos/{}/issues", ch.flake_repo);
-    let body = serde_json::json!({
-        "title": format!("Update to v{version}"),
-        "body": format!("New release v{version}\n\nSource: {source_url}\nSHA256: {hash}"),
+    let existing_sha = github_api("nix", "GET", &api_url, None)
+        .ok()
+        .and_then(|resp| resp["sha"].as_str().map(|s| s.to_string()));
+
+    let mut body = serde_json::json!({
+        "message": format!("Update {binary} to {version}"),
+        "content": BASE64.encode(flake.as_bytes()),
     });
-    github_api("nix", "POST", &url, Some(&body.to_string()))?;
-    println!("[nix] Created update issue on {}", ch.flake_repo);
+    if let Some(sha) = existing_sha {
+        body["sha"] = serde_json::Value::String(sha);
+    }
+
+    github_api("nix", "PUT", &api_url, Some(&body.to_string()))?;
+    println!("[nix] Updated flake.nix in {}", flake_repo);
     Ok(())
 }
 
@@ -742,5 +846,88 @@ mod tests {
         assert!(script.contains("Darwin)"));
         assert!(script.contains("x86_64|amd64)"));
         assert!(script.contains("arm64|aarch64)"));
+    }
+
+    // --- nix_system tests ---
+
+    #[test]
+    fn nix_system_x86_64_linux() {
+        assert_eq!(nix_system("x86_64-unknown-linux-gnu"), Some("x86_64-linux"));
+    }
+
+    #[test]
+    fn nix_system_aarch64_linux() {
+        assert_eq!(nix_system("aarch64-unknown-linux-gnu"), Some("aarch64-linux"));
+    }
+
+    #[test]
+    fn nix_system_x86_64_darwin() {
+        assert_eq!(nix_system("x86_64-apple-darwin"), Some("x86_64-darwin"));
+    }
+
+    #[test]
+    fn nix_system_aarch64_darwin() {
+        assert_eq!(nix_system("aarch64-apple-darwin"), Some("aarch64-darwin"));
+    }
+
+    #[test]
+    fn nix_system_unknown_target() {
+        assert_eq!(nix_system("wasm32-unknown-unknown"), None);
+    }
+
+    // --- generate_flake tests ---
+
+    #[test]
+    fn generate_flake_contains_description() {
+        let flake = generate_flake("mytool", "mytool", "owner/repo", "1.0.0", &[
+            ("x86_64-linux", "x86_64-unknown-linux-gnu", "abc123"),
+        ]);
+        assert!(flake.contains(r#"description = "mytool""#));
+    }
+
+    #[test]
+    fn generate_flake_contains_version() {
+        let flake = generate_flake("mytool", "mytool", "owner/repo", "2.3.4", &[
+            ("x86_64-linux", "x86_64-unknown-linux-gnu", "abc123"),
+        ]);
+        assert!(flake.contains(r#"version = "2.3.4""#));
+    }
+
+    #[test]
+    fn generate_flake_contains_sha256_values() {
+        let flake = generate_flake("mytool", "mytool", "owner/repo", "1.0.0", &[
+            ("x86_64-linux", "x86_64-unknown-linux-gnu", "deadbeef"),
+            ("aarch64-darwin", "aarch64-apple-darwin", "cafebabe"),
+        ]);
+        assert!(flake.contains(r#"sha256 = "deadbeef""#));
+        assert!(flake.contains(r#"sha256 = "cafebabe""#));
+    }
+
+    #[test]
+    fn generate_flake_contains_binary_name() {
+        let flake = generate_flake("mytool", "mybinary", "owner/repo", "1.0.0", &[
+            ("x86_64-linux", "x86_64-unknown-linux-gnu", "abc"),
+        ]);
+        assert!(flake.contains(r#"pname = "mybinary""#));
+        assert!(flake.contains("install -m755 -D mybinary $out/bin/mybinary"));
+    }
+
+    #[test]
+    fn generate_flake_contains_download_urls() {
+        let flake = generate_flake("mytool", "mytool", "owner/repo", "1.0.0", &[
+            ("x86_64-linux", "x86_64-unknown-linux-gnu", "abc"),
+            ("aarch64-darwin", "aarch64-apple-darwin", "def"),
+        ]);
+        assert!(flake.contains("https://github.com/owner/repo/releases/download/v1.0.0/mytool-1.0.0-"));
+    }
+
+    #[test]
+    fn generate_flake_contains_system_entries() {
+        let flake = generate_flake("mytool", "mytool", "owner/repo", "1.0.0", &[
+            ("x86_64-linux", "x86_64-unknown-linux-gnu", "abc"),
+            ("aarch64-darwin", "aarch64-apple-darwin", "def"),
+        ]);
+        assert!(flake.contains(r#""x86_64-linux" = mkPkg"#));
+        assert!(flake.contains(r#""aarch64-darwin" = mkPkg"#));
     }
 }

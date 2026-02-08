@@ -66,7 +66,7 @@ pub struct CurlChannel {
 pub struct NixChannel {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    pub flake_repo: String,
+    pub flake_repo: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -110,7 +110,7 @@ enabled = true
 # [channels.curl]
 
 # [channels.nix]
-# flake_repo = "owner/nix-repo"
+# flake_repo = "owner/nix-repo"  # defaults to project repo
 "#
     )
 }
