@@ -310,6 +310,47 @@ fn to_pascal_case(s: &str) -> String {
         .collect()
 }
 
+fn command_exists(cmd: &str) -> bool {
+    Command::new("sh")
+        .args(["-c", &format!("command -v {cmd}")])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+fn preflight(selected: &[&str]) -> Result<()> {
+    let mut missing = Vec::new();
+
+    let needs_github_api = selected.iter().any(|ch| matches!(*ch, "github" | "homebrew" | "curl" | "nix"));
+
+    if needs_github_api {
+        if std::env::var("GITHUB_TOKEN").is_err() {
+            missing.push("GITHUB_TOKEN env var is required for: github, homebrew, curl, nix");
+        }
+        if !command_exists("curl") {
+            missing.push("curl command is required for: github, homebrew, curl, nix");
+        }
+    }
+
+    if selected.contains(&"nix") && !command_exists("nix") {
+        missing.push("nix command is required for: nix");
+    }
+
+    if selected.contains(&"cargo") && !command_exists("cargo") {
+        missing.push("cargo command is required for: cargo");
+    }
+
+    let depends_on_github = selected.iter().any(|ch| matches!(*ch, "homebrew" | "curl" | "nix"));
+    if depends_on_github && !selected.contains(&"github") {
+        missing.push("github channel must be selected when using: homebrew, curl, nix");
+    }
+
+    if !missing.is_empty() {
+        bail!("preflight check failed:\n  - {}", missing.join("\n  - "));
+    }
+
+    Ok(())
+}
+
 // --- Public entry point ---
 
 const KNOWN_CHANNELS: &[&str] = &["github", "homebrew", "cargo", "curl", "nix"];
@@ -336,6 +377,8 @@ pub fn release(config: &Config, version_override: Option<&str>, channels: Option
         println!("No channels enabled.");
         return Ok(());
     }
+
+    preflight(&selected)?;
 
     let version = detect_version(config, version_override)?;
     println!(
@@ -635,11 +678,6 @@ fn release_nix(
     let binary = config.project.binary();
     let repo = &config.project.repo;
     let flake_repo = ch.flake_repo.as_deref().unwrap_or(repo);
-
-    // Require nix to generate flake.lock
-    if run_cmd("nix", None, "sh", &["-lc", "nix --version"]).is_err() {
-        bail!("[nix] nix is required for the nix channel but was not found");
-    }
 
     // Download release assets from GitHub and hash them (local archives may differ)
     let release_url = format!("https://api.github.com/repos/{repo}/releases/tags/v{version}");
@@ -988,5 +1026,68 @@ mod tests {
         ]);
         assert!(flake.contains(r#""x86_64-linux" = let"#));
         assert!(flake.contains(r#""aarch64-darwin" = let"#));
+    }
+
+    // --- preflight tests ---
+
+    #[test]
+    fn preflight_ok_with_no_channels() {
+        assert!(preflight(&[]).is_ok());
+    }
+
+    #[test]
+    fn preflight_requires_github_token() {
+        // Remove GITHUB_TOKEN to ensure the check triggers
+        let saved = std::env::var("GITHUB_TOKEN").ok();
+        unsafe { std::env::remove_var("GITHUB_TOKEN") };
+
+        let err = preflight(&["github"]).unwrap_err();
+        assert!(err.to_string().contains("GITHUB_TOKEN"), "got: {err}");
+
+        if let Some(val) = saved {
+            unsafe { std::env::set_var("GITHUB_TOKEN", val) };
+        }
+    }
+
+    #[test]
+    fn preflight_requires_nix() {
+        // This test assumes `nix` is not installed in the test environment,
+        // which is typical for CI. If nix IS installed, we can't test the
+        // negative case, so skip.
+        if command_exists("nix") {
+            return;
+        }
+
+        // Ensure GITHUB_TOKEN is set so that check doesn't also fail
+        let saved = std::env::var("GITHUB_TOKEN").ok();
+        unsafe { std::env::set_var("GITHUB_TOKEN", "fake-token-for-test") };
+
+        let err = preflight(&["github", "nix"]).unwrap_err();
+        assert!(err.to_string().contains("nix command"), "got: {err}");
+
+        match saved {
+            Some(val) => unsafe { std::env::set_var("GITHUB_TOKEN", val) },
+            None => unsafe { std::env::remove_var("GITHUB_TOKEN") },
+        }
+    }
+
+    #[test]
+    fn preflight_requires_github_for_dependent_channels() {
+        // Ensure GITHUB_TOKEN is set so only the dependency check triggers
+        let saved = std::env::var("GITHUB_TOKEN").ok();
+        unsafe { std::env::set_var("GITHUB_TOKEN", "fake-token-for-test") };
+
+        for ch in &["homebrew", "curl", "nix"] {
+            let err = preflight(&[ch]).unwrap_err();
+            assert!(
+                err.to_string().contains("github channel must be selected"),
+                "channel {ch}: got: {err}"
+            );
+        }
+
+        match saved {
+            Some(val) => unsafe { std::env::set_var("GITHUB_TOKEN", val) },
+            None => unsafe { std::env::remove_var("GITHUB_TOKEN") },
+        }
     }
 }
