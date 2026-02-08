@@ -126,9 +126,14 @@ fn host_target() -> Option<String> {
 }
 
 fn needs_cross_linker(host: &str, target: &str) -> bool {
-    let host_suffix = host.splitn(2, '-').nth(1).unwrap_or(host);
-    let target_suffix = target.splitn(2, '-').nth(1).unwrap_or(target);
-    host_suffix != target_suffix
+    if host == target {
+        return false;
+    }
+    // macOS toolchain handles both x86_64 and aarch64 natively
+    if host.contains("darwin") && target.contains("darwin") {
+        return false;
+    }
+    true
 }
 
 fn has_cargo_zigbuild() -> bool {
@@ -826,6 +831,14 @@ mod tests {
         assert!(!needs_cross_linker(
             "aarch64-apple-darwin",
             "aarch64-apple-darwin"
+        ));
+    }
+
+    #[test]
+    fn needs_cross_linker_linux_different_arch() {
+        assert!(needs_cross_linker(
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu"
         ));
     }
 
