@@ -23,6 +23,57 @@ fn run_cmd(label: &str, dir: Option<&Path>, cmd: &str, args: &[&str]) -> Result<
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn github_token() -> Result<String> {
+    std::env::var("GITHUB_TOKEN").context("GITHUB_TOKEN environment variable not set")
+}
+
+fn github_api(label: &str, method: &str, url: &str, json_body: Option<&str>) -> Result<serde_json::Value> {
+    let token = github_token()?;
+    let auth = format!("Authorization: Bearer {token}");
+    println!("[{label}] {method} {url}");
+    let mut cmd = Command::new("curl");
+    cmd.args(["-fsSL", "-X", method]);
+    cmd.args(["-H", "Accept: application/vnd.github+json"]);
+    cmd.args(["-H", &auth]);
+    if let Some(body) = json_body {
+        cmd.args(["-H", "Content-Type: application/json"]);
+        cmd.args(["-d", body]);
+    }
+    cmd.arg(url);
+    let output = cmd.output().with_context(|| format!("[{label}] failed to run curl"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("[{label}] API request failed: {stderr}");
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(stdout.trim()).with_context(|| format!("[{label}] failed to parse API response"))
+}
+
+fn github_upload_asset(label: &str, upload_url: &str, file_path: &Path, name: &str, content_type: &str) -> Result<()> {
+    let token = github_token()?;
+    let auth = format!("Authorization: Bearer {token}");
+    let ct = format!("Content-Type: {content_type}");
+    let url = format!("{upload_url}?name={name}");
+    let data_arg = format!("@{}", file_path.to_string_lossy());
+    println!("[{label}] Uploading {name}");
+    let mut cmd = Command::new("curl");
+    cmd.args(["-fsSL", "-X", "POST"]);
+    cmd.args(["-H", "Accept: application/vnd.github+json"]);
+    cmd.args(["-H", &auth]);
+    cmd.args(["-H", &ct]);
+    cmd.args(["--data-binary", &data_arg]);
+    cmd.arg(&url);
+    let output = cmd.output().with_context(|| format!("[{label}] failed to upload {name}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("[{label}] upload of {name} failed: {stderr}");
+    }
+    Ok(())
+}
+
 fn substitute(template: &str, vars: &[(&str, &str)]) -> String {
     let mut result = template.to_string();
     for (key, value) in vars {
@@ -49,12 +100,20 @@ fn detect_version(config: &Config, version_override: Option<&str>) -> Result<Str
     Ok(raw.strip_prefix('v').unwrap_or(&raw).to_string())
 }
 
+fn confirm(prompt: &str) -> Result<bool> {
+    eprint!("{prompt} [y/N] ");
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(input.trim().eq_ignore_ascii_case("y"))
+}
+
 fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBuf)>> {
     let binary = config.project.binary();
     let staging = PathBuf::from("target/release-staging");
     std::fs::create_dir_all(&staging)?;
 
     let mut archives = Vec::new();
+    let mut failed = Vec::new();
     for target in &config.build.targets {
         let vars = &[
             ("target", target.as_str()),
@@ -68,7 +127,11 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
             let (bin, args) = parts
                 .split_first()
                 .ok_or_else(|| anyhow::anyhow!("empty build command"))?;
-            run_cmd("build", None, bin, args)?;
+            if let Err(e) = run_cmd("build", None, bin, args) {
+                eprintln!("[build] Warning: target {target} failed: {e}");
+                failed.push(target.clone());
+                continue;
+            }
 
             let artifact_template = config
                 .build
@@ -86,7 +149,9 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
         };
 
         if !artifact_path.exists() {
-            bail!("build artifact not found: {}", artifact_path.display());
+            eprintln!("[build] Warning: target {target} failed: artifact not found at {}", artifact_path.display());
+            failed.push(target.clone());
+            continue;
         }
 
         let archive_name = format!("{binary}-{version}-{target}.tar.gz");
@@ -109,6 +174,37 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
 
         archives.push((target.clone(), archive_path));
     }
+
+    if archives.is_empty() {
+        bail!("all build targets failed");
+    }
+
+    if !failed.is_empty() {
+        eprintln!("\n{}/{} targets failed:", failed.len(), config.build.targets.len());
+        for t in &failed {
+            eprintln!("  - {t}");
+        }
+        if config.build.command.as_ref().is_some_and(|c| c.contains("cargo")) {
+            eprintln!("\nTo install missing targets:");
+            for t in &failed {
+                eprintln!("  rustup target add {t}");
+            }
+        }
+        if config.build.pre_built_dir.is_some() {
+            let dir = config.build.pre_built_dir.as_ref().unwrap();
+            eprintln!("\nExpected pre-built artifacts in {dir}:");
+            for t in &failed {
+                eprintln!("  {dir}{binary}-{t}");
+            }
+        }
+        eprintln!();
+        let succeeded: Vec<&str> = archives.iter().map(|(t, _)| t.as_str()).collect();
+        eprintln!("Succeeded: {}", succeeded.join(", "));
+        if !confirm("Continue with successful targets?")? {
+            bail!("aborted by user");
+        }
+    }
+
     Ok(archives)
 }
 
@@ -186,26 +282,27 @@ pub fn release(config: &Config, version_override: Option<&str>) -> Result<()> {
 
 // --- Channel implementations ---
 
+fn create_github_release(repo: &str, version: &str) -> Result<String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases");
+    let body = serde_json::json!({
+        "tag_name": format!("v{version}"),
+        "name": format!("v{version}"),
+        "generate_release_notes": true,
+    });
+    let resp = github_api("github", "POST", &url, Some(&body.to_string()))?;
+    let upload_url = resp["upload_url"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("[github] missing upload_url in response"))?;
+    // Strip the {?name,label} URI template suffix
+    Ok(upload_url.split('{').next().unwrap_or(upload_url).to_string())
+}
+
 fn release_github(config: &Config, version: &str, archives: &[(String, PathBuf)]) -> Result<()> {
-    let tag = format!("v{version}");
-    let archive_strs: Vec<String> = archives
-        .iter()
-        .map(|(_, p)| p.to_string_lossy().into_owned())
-        .collect();
-    let mut args = vec![
-        "release",
-        "create",
-        &tag,
-        "--repo",
-        &config.project.repo,
-        "--title",
-        &tag,
-        "--generate-notes",
-    ];
-    for s in &archive_strs {
-        args.push(s);
+    let upload_url = create_github_release(&config.project.repo, version)?;
+    for (_, path) in archives {
+        let name = path.file_name().unwrap().to_string_lossy();
+        github_upload_asset("github", &upload_url, path, &name, "application/gzip")?;
     }
-    run_cmd("github", None, "gh", &args)?;
     println!("[github] Created release v{version}");
     Ok(())
 }
@@ -237,7 +334,8 @@ fn release_homebrew(
     if tap_dir.exists() {
         std::fs::remove_dir_all(&tap_dir)?;
     }
-    run_cmd("homebrew", None, "gh", &["repo", "clone", &ch.tap, &tap_dir.to_string_lossy()])?;
+    let clone_url = format!("https://github.com/{}.git", ch.tap);
+    run_cmd("homebrew", None, "git", &["clone", &clone_url, &tap_dir.to_string_lossy()])?;
 
     let formula_dir = tap_dir.join("Formula");
     std::fs::create_dir_all(&formula_dir)?;
@@ -305,20 +403,15 @@ fn release_curl(config: &Config, version: &str) -> Result<()> {
     let script_path = PathBuf::from("target/release-staging/install.sh");
     std::fs::write(&script_path, &script)?;
 
-    run_cmd(
-        "curl",
-        None,
-        "gh",
-        &[
-            "release",
-            "upload",
-            &format!("v{version}"),
-            &script_path.to_string_lossy(),
-            "--repo",
-            repo,
-            "--clobber",
-        ],
-    )?;
+    // Get the release to find its upload URL
+    let url = format!("https://api.github.com/repos/{repo}/releases/tags/v{version}");
+    let resp = github_api("curl", "GET", &url, None)?;
+    let upload_url = resp["upload_url"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("[curl] could not find release v{version} — is the github channel enabled?"))?;
+    let upload_url = upload_url.split('{').next().unwrap_or(upload_url);
+
+    github_upload_asset("curl", upload_url, &script_path, "install.sh", "text/plain")?;
     println!("[curl] Uploaded install.sh to release v{version}");
     Ok(())
 }
@@ -378,24 +471,12 @@ fn release_nix(config: &Config, version: &str) -> Result<()> {
         &["--unpack", &source_url],
     )?;
 
-    let body = format!(
-        "New release v{version}\n\nSource: {source_url}\nSHA256: {hash}"
-    );
-    run_cmd(
-        "nix",
-        None,
-        "gh",
-        &[
-            "issue",
-            "create",
-            "--repo",
-            &ch.flake_repo,
-            "--title",
-            &format!("Update to v{version}"),
-            "--body",
-            &body,
-        ],
-    )?;
+    let url = format!("https://api.github.com/repos/{}/issues", ch.flake_repo);
+    let body = serde_json::json!({
+        "title": format!("Update to v{version}"),
+        "body": format!("New release v{version}\n\nSource: {source_url}\nSHA256: {hash}"),
+    });
+    github_api("nix", "POST", &url, Some(&body.to_string()))?;
     println!("[nix] Created update issue on {}", ch.flake_repo);
     Ok(())
 }
