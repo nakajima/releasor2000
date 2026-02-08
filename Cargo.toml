@@ -2,6 +2,8 @@
 name = "releasor2000"
 version = "0.1.1"
 edition = "2024"
+description = "Release your bin everywhere*."
+license = "I wouldn't"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
