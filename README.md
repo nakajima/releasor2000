@@ -1,8 +1,8 @@
 # releasor2000
 
-Release your software everywhere.
+Release everywhere.
 
-A CLI tool that builds your Rust project for multiple targets and publishes releases across GitHub, Homebrew, Cargo, curl-installable scripts, and Nix flakes — all from a single config file.
+A CLI tool that builds a Rust project for multiple targets and publishes releases across GitHub, Homebrew, Cargo, curl-installable scripts, and Nix flakes.
 
 ## Install
 
@@ -21,7 +21,7 @@ cargo install releasor2000
 ### Curl
 
 ```sh
-curl -fsSL https://github.com/nakajima/releasor2000/releases/download/v0.1.1/install.sh | sh
+curl -fsSL https://github.com/nakajima/releasor2000/releases/latest/download/install.sh | sh
 ```
 
 ### Nix
