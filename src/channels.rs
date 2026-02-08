@@ -458,14 +458,15 @@ fn generate_formula(
   homepage "https://github.com/{repo}"
   version "{version}"
 
-  on_macos_arm do
-    url "https://github.com/{repo}/releases/download/v{version}/{binary}-{version}-aarch64-apple-darwin.tar.gz"
-    sha256 "{arm_sha}"
-  end
-
-  on_macos_intel do
-    url "https://github.com/{repo}/releases/download/v{version}/{binary}-{version}-x86_64-apple-darwin.tar.gz"
-    sha256 "{intel_sha}"
+  on_macos do
+    on_arm do
+      url "https://github.com/{repo}/releases/download/v{version}/{binary}-{version}-aarch64-apple-darwin.tar.gz"
+      sha256 "{arm_sha}"
+    end
+    on_intel do
+      url "https://github.com/{repo}/releases/download/v{version}/{binary}-{version}-x86_64-apple-darwin.tar.gz"
+      sha256 "{intel_sha}"
+    end
   end
 
   def install
@@ -629,8 +630,9 @@ mod tests {
     #[test]
     fn generate_formula_contains_arch_blocks() {
         let formula = generate_formula("tool", "tool", "owner/repo", "1.0.0", "armsha", "intelsha");
-        assert!(formula.contains("on_macos_arm do"));
-        assert!(formula.contains("on_macos_intel do"));
+        assert!(formula.contains("on_macos do"));
+        assert!(formula.contains("on_arm do"));
+        assert!(formula.contains("on_intel do"));
         assert!(formula.contains("sha256 \"armsha\""));
         assert!(formula.contains("sha256 \"intelsha\""));
     }
