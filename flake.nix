@@ -1,6 +1,8 @@
 {
   description = "releasor2000";
 
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+
   outputs = { self, nixpkgs }: {
     packages = {
       "x86_64-darwin" = let
@@ -10,7 +12,7 @@
           version = "0.0.5";
           src = pkgs.fetchurl {
             url = "https://github.com/nakajima/releasor2000/releases/download/v0.0.5/releasor2000-0.0.5-x86_64-apple-darwin.tar.gz";
-            sha256 = "d67f5a1423763b4cdb8482aa35d118608e73d62a385d09853ec58e2e197eb0a5";
+            sha256 = "913298e6a38445fffc368230bf1473ff5b52d5ceb6d7725d41c8e61fa28ae527";
           };
           sourceRoot = ".";
           installPhase = ''
@@ -25,7 +27,7 @@
           version = "0.0.5";
           src = pkgs.fetchurl {
             url = "https://github.com/nakajima/releasor2000/releases/download/v0.0.5/releasor2000-0.0.5-aarch64-apple-darwin.tar.gz";
-            sha256 = "3fe849cc240d5402fd479a66c55426a6c567f3846ed3d363442eea5191f64aa1";
+            sha256 = "e6af5254e42a93bc97c7841f99b29a6c70125c5ca40af32102b39a17cd643e9e";
           };
           sourceRoot = ".";
           installPhase = ''
@@ -40,7 +42,7 @@
           version = "0.0.5";
           src = pkgs.fetchurl {
             url = "https://github.com/nakajima/releasor2000/releases/download/v0.0.5/releasor2000-0.0.5-x86_64-unknown-linux-gnu.tar.gz";
-            sha256 = "d74595fef0508132831f712f24a078f5b81fdf62ce78269850f389bc32cc5c2d";
+            sha256 = "eadb9644d2db284a64d30eb9f10c1e994fbfd6fdbb857e7e6f539f92edded106";
           };
           sourceRoot = ".";
           installPhase = ''
@@ -55,7 +57,7 @@
           version = "0.0.5";
           src = pkgs.fetchurl {
             url = "https://github.com/nakajima/releasor2000/releases/download/v0.0.5/releasor2000-0.0.5-aarch64-unknown-linux-gnu.tar.gz";
-            sha256 = "08d90cb51e64c972716bbeed71ac8678817f824071cb633f76f6d63e96665935";
+            sha256 = "e3b650c3a1c20300f044eb610562f2d3932249c543552afaa5c141d01d294952";
           };
           sourceRoot = ".";
           installPhase = ''
