@@ -284,12 +284,14 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
 }
 
 fn sha256(path: &Path) -> Result<String> {
-    let output = run_cmd("sha256", None, "shasum", &["-a", "256", &path.to_string_lossy()])?;
+    let path_str = path.to_string_lossy();
+    let output = run_cmd("sha256", None, "shasum", &["-a", "256", &path_str])
+        .or_else(|_| run_cmd("sha256", None, "sha256sum", &[&path_str]))?;
     output
         .split_whitespace()
         .next()
         .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("unexpected shasum output"))
+        .ok_or_else(|| anyhow::anyhow!("unexpected sha256 output"))
 }
 
 fn to_pascal_case(s: &str) -> String {
