@@ -625,6 +625,11 @@ fn release_nix(
     let repo = &config.project.repo;
     let flake_repo = ch.flake_repo.as_deref().unwrap_or(repo);
 
+    // Require nix to generate flake.lock
+    if run_cmd("nix", None, "sh", &["-lc", "nix --version"]).is_err() {
+        bail!("[nix] nix is required for the nix channel but was not found");
+    }
+
     // Download release assets from GitHub and hash them (local archives may differ)
     let release_url = format!("https://api.github.com/repos/{repo}/releases/tags/v{version}");
     let release = github_api("nix", "GET", &release_url, None)
@@ -688,39 +693,19 @@ fn release_nix(
         Ok(())
     };
 
-    push_file("flake.nix", &flake, &format!("Update {binary} to {version}"))?;
-
-    // Try to generate and push flake.lock if nix is available
-    let lock_url = format!(
-        "https://api.github.com/repos/{}/contents/flake.lock",
-        flake_repo
-    );
-    let has_lock = github_api("nix", "GET", &lock_url, None).is_ok();
-
+    // Generate flake.lock
     let tmp_dir = std::env::temp_dir().join(format!("releasor2000-nix-{version}"));
     std::fs::create_dir_all(&tmp_dir)?;
     std::fs::write(tmp_dir.join("flake.nix"), &flake)?;
     let lock_cmd = format!("cd '{}' && nix flake lock", tmp_dir.display());
-    let lock_result = run_cmd("nix", None, "sh", &["-lc", &lock_cmd]);
-    match lock_result {
-        Ok(_) => {
-            let flake_lock = std::fs::read_to_string(tmp_dir.join("flake.lock"))
-                .context("[nix] failed to read generated flake.lock")?;
-            push_file("flake.lock", &flake_lock, &format!("Update flake.lock for {binary} {version}"))?;
-            println!("[nix] Updated flake.nix and flake.lock in {flake_repo}");
-        }
-        Err(_) if has_lock => {
-            println!("[nix] Updated flake.nix in {flake_repo} (existing flake.lock kept)");
-        }
-        Err(_) => {
-            println!("[nix] Updated flake.nix in {flake_repo}");
-            eprintln!("[nix] Warning: could not generate flake.lock (nix not found)");
-            eprintln!("[nix] Run this once on a machine with nix to create it:");
-            eprintln!("  git clone git@github.com:{flake_repo}.git && cd {} && nix flake lock && git add flake.lock && git commit -m 'Add flake.lock' && git push",
-                flake_repo.split('/').last().unwrap_or(flake_repo));
-        }
-    }
+    run_cmd("nix", None, "sh", &["-lc", &lock_cmd])?;
+    let flake_lock = std::fs::read_to_string(tmp_dir.join("flake.lock"))
+        .context("[nix] failed to read generated flake.lock")?;
     std::fs::remove_dir_all(&tmp_dir).ok();
+
+    push_file("flake.nix", &flake, &format!("Update {binary} to {version}"))?;
+    push_file("flake.lock", &flake_lock, &format!("Update flake.lock for {binary} {version}"))?;
+    println!("[nix] Updated flake.nix and flake.lock in {flake_repo}");
     Ok(())
 }
 
