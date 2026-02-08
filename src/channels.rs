@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -107,10 +109,56 @@ fn confirm(prompt: &str) -> Result<bool> {
     Ok(input.trim().eq_ignore_ascii_case("y"))
 }
 
+fn parse_host_target(rustc_output: &str) -> Option<String> {
+    rustc_output
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(|s| s.trim().to_string())
+}
+
+fn host_target() -> Option<String> {
+    Command::new("rustc")
+        .args(["-vV"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| parse_host_target(&String::from_utf8_lossy(&o.stdout)))
+}
+
+fn needs_cross_linker(host: &str, target: &str) -> bool {
+    let host_suffix = host.splitn(2, '-').nth(1).unwrap_or(host);
+    let target_suffix = target.splitn(2, '-').nth(1).unwrap_or(target);
+    host_suffix != target_suffix
+}
+
+fn has_cargo_zigbuild() -> bool {
+    Command::new("cargo-zigbuild")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+fn parse_installed_targets(output: &str) -> HashSet<String> {
+    output.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
+}
+
+fn installed_targets() -> HashSet<String> {
+    Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_installed_targets(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
 fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBuf)>> {
     let binary = config.project.binary();
     let staging = PathBuf::from("target/release-staging");
     std::fs::create_dir_all(&staging)?;
+
+    let host = host_target().unwrap_or_default();
+    let zigbuild_available = has_cargo_zigbuild();
 
     let mut archives = Vec::new();
     let mut failed = Vec::new();
@@ -123,6 +171,15 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
 
         let artifact_path = if let Some(cmd_template) = &config.build.command {
             let cmd_str = substitute(cmd_template, vars);
+            let cmd_str = if cmd_str.contains("cargo build")
+                && zigbuild_available
+                && needs_cross_linker(&host, target)
+            {
+                eprintln!("[build] Using cargo-zigbuild for cross-compilation target {target}");
+                cmd_str.replace("cargo build", "cargo zigbuild")
+            } else {
+                cmd_str
+            };
             let parts: Vec<&str> = cmd_str.split_whitespace().collect();
             let (bin, args) = parts
                 .split_first()
@@ -185,9 +242,22 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
             eprintln!("  - {t}");
         }
         if config.build.command.as_ref().is_some_and(|c| c.contains("cargo")) {
-            eprintln!("\nTo install missing targets:");
-            for t in &failed {
-                eprintln!("  rustup target add {t}");
+            let installed = installed_targets();
+            let (installed_failed, missing): (Vec<_>, Vec<_>) =
+                failed.iter().partition(|t| installed.contains(t.as_str()));
+
+            if !missing.is_empty() {
+                eprintln!("\nMissing targets (install with rustup):");
+                for t in &missing {
+                    eprintln!("  rustup target add {t}");
+                }
+            }
+            if !installed_failed.is_empty() {
+                eprintln!("\nInstalled but failed to build (missing cross-compilation linker):");
+                for t in &installed_failed {
+                    eprintln!("  - {t}");
+                }
+                eprintln!("  Tip: install `cross` (uses Docker) or `cargo-zigbuild` (uses zig) for cross-compilation");
             }
         }
         if config.build.pre_built_dir.is_some() {
@@ -235,9 +305,27 @@ fn to_pascal_case(s: &str) -> String {
 
 // --- Public entry point ---
 
-pub fn release(config: &Config, version_override: Option<&str>) -> Result<()> {
+const KNOWN_CHANNELS: &[&str] = &["github", "homebrew", "cargo", "curl", "nix"];
+
+pub fn release(config: &Config, version_override: Option<&str>, channels: Option<&[String]>) -> Result<()> {
     let enabled = config.enabled_channels();
-    if enabled.is_empty() {
+
+    let selected: Vec<&str> = match channels {
+        Some(requested) => {
+            for ch in requested {
+                if !KNOWN_CHANNELS.contains(&ch.as_str()) {
+                    bail!("unknown channel: {ch} (known: {})", KNOWN_CHANNELS.join(", "));
+                }
+                if !enabled.contains(&ch.as_str()) {
+                    bail!("channel {ch} is not enabled in config");
+                }
+            }
+            requested.iter().map(|s| s.as_str()).collect()
+        }
+        None => enabled.clone(),
+    };
+
+    if selected.is_empty() {
         println!("No channels enabled.");
         return Ok(());
     }
@@ -246,7 +334,7 @@ pub fn release(config: &Config, version_override: Option<&str>) -> Result<()> {
     println!(
         "Releasing {} v{version} via: {}",
         config.project.name,
-        enabled.join(", ")
+        selected.join(", ")
     );
 
     let archives = build_artifacts(config, &version)?;
@@ -254,10 +342,10 @@ pub fn release(config: &Config, version_override: Option<&str>) -> Result<()> {
     // Run github first so other channels can reference release URLs
     let ordered: Vec<&str> = {
         let mut v = Vec::new();
-        if enabled.contains(&"github") {
+        if selected.contains(&"github") {
             v.push("github");
         }
-        for ch in &enabled {
+        for ch in &selected {
             if *ch != "github" {
                 v.push(ch);
             }
@@ -317,6 +405,10 @@ fn release_homebrew(
     let binary = config.project.binary();
     let repo = &config.project.repo;
 
+    let release_url = format!("https://api.github.com/repos/{repo}/releases/tags/v{version}");
+    github_api("homebrew", "GET", &release_url, None)
+        .with_context(|| format!("[homebrew] GitHub release v{version} not found — run the github channel first"))?;
+
     let mut darwin_arm_sha = String::new();
     let mut darwin_intel_sha = String::new();
 
@@ -330,25 +422,23 @@ fn release_homebrew(
 
     let formula = generate_formula(formula_name, binary, repo, version, &darwin_arm_sha, &darwin_intel_sha);
 
-    let tap_dir = PathBuf::from("target/release-staging/tap");
-    if tap_dir.exists() {
-        std::fs::remove_dir_all(&tap_dir)?;
+    let file_path = format!("Formula/{formula_name}.rb");
+    let api_url = format!("https://api.github.com/repos/{}/contents/{}", ch.tap, file_path);
+
+    // Get current file SHA if it exists (required for updates)
+    let existing_sha = github_api("homebrew", "GET", &api_url, None)
+        .ok()
+        .and_then(|resp| resp["sha"].as_str().map(|s| s.to_string()));
+
+    let mut body = serde_json::json!({
+        "message": format!("Update {formula_name} to {version}"),
+        "content": BASE64.encode(formula.as_bytes()),
+    });
+    if let Some(sha) = existing_sha {
+        body["sha"] = serde_json::Value::String(sha);
     }
-    let clone_url = format!("https://github.com/{}.git", ch.tap);
-    run_cmd("homebrew", None, "git", &["clone", &clone_url, &tap_dir.to_string_lossy()])?;
 
-    let formula_dir = tap_dir.join("Formula");
-    std::fs::create_dir_all(&formula_dir)?;
-    std::fs::write(formula_dir.join(format!("{formula_name}.rb")), &formula)?;
-
-    run_cmd("homebrew", Some(&tap_dir), "git", &["add", "-A"])?;
-    run_cmd(
-        "homebrew",
-        Some(&tap_dir),
-        "git",
-        &["commit", "-m", &format!("Update {formula_name} to {version}")],
-    )?;
-    run_cmd("homebrew", Some(&tap_dir), "git", &["push"])?;
+    github_api("homebrew", "PUT", &api_url, Some(&body.to_string()))?;
     println!("[homebrew] Updated formula {formula_name} in {}", ch.tap);
     Ok(())
 }
@@ -556,6 +646,75 @@ mod tests {
     fn generate_formula_contains_binary_install() {
         let formula = generate_formula("tool", "mybinary", "owner/repo", "1.0.0", "a", "b");
         assert!(formula.contains("bin.install \"mybinary\""));
+    }
+
+    // --- parse_host_target tests ---
+
+    #[test]
+    fn parse_host_target_extracts_host_line() {
+        let output = "rustc 1.77.0 (aedd173a2 2024-03-17)\nbinary: rustc\nhost: aarch64-apple-darwin\nrelease: 1.77.0\n";
+        assert_eq!(
+            parse_host_target(output),
+            Some("aarch64-apple-darwin".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_host_target_missing() {
+        assert_eq!(parse_host_target("no host here\n"), None);
+    }
+
+    // --- needs_cross_linker tests ---
+
+    #[test]
+    fn needs_cross_linker_same_os_different_arch() {
+        assert!(!needs_cross_linker(
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin"
+        ));
+    }
+
+    #[test]
+    fn needs_cross_linker_different_os() {
+        assert!(needs_cross_linker(
+            "aarch64-apple-darwin",
+            "x86_64-unknown-linux-gnu"
+        ));
+    }
+
+    #[test]
+    fn needs_cross_linker_identical() {
+        assert!(!needs_cross_linker(
+            "aarch64-apple-darwin",
+            "aarch64-apple-darwin"
+        ));
+    }
+
+    // --- parse_installed_targets tests ---
+
+    #[test]
+    fn parse_installed_targets_typical_output() {
+        let output = "aarch64-apple-darwin\nx86_64-apple-darwin\nx86_64-unknown-linux-gnu\n";
+        let result = parse_installed_targets(output);
+        assert_eq!(result.len(), 3);
+        assert!(result.contains("aarch64-apple-darwin"));
+        assert!(result.contains("x86_64-apple-darwin"));
+        assert!(result.contains("x86_64-unknown-linux-gnu"));
+    }
+
+    #[test]
+    fn parse_installed_targets_empty_output() {
+        assert!(parse_installed_targets("").is_empty());
+        assert!(parse_installed_targets("  \n  \n").is_empty());
+    }
+
+    #[test]
+    fn parse_installed_targets_trims_whitespace() {
+        let output = "  aarch64-apple-darwin  \n  x86_64-apple-darwin \n";
+        let result = parse_installed_targets(output);
+        assert_eq!(result.len(), 2);
+        assert!(result.contains("aarch64-apple-darwin"));
+        assert!(result.contains("x86_64-apple-darwin"));
     }
 
     // --- generate_install_script tests ---

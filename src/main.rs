@@ -23,6 +23,8 @@ enum Command {
     Release {
         #[arg(long)]
         version: Option<String>,
+        /// Channels to release to (defaults to all enabled channels)
+        channels: Vec<String>,
     },
     /// Validate the config file without doing anything
     Validate,
@@ -53,6 +55,9 @@ fn main() -> Result<()> {
             println!("Enabled channels: {:?}", config.enabled_channels());
             Ok(())
         }
-        Command::Release { version } => channels::release(&config, version.as_deref()),
+        Command::Release { version, channels } => {
+            let channels = if channels.is_empty() { None } else { Some(channels) };
+            channels::release(&config, version.as_deref(), channels.as_deref())
+        }
     }
 }
