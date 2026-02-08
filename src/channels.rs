@@ -547,7 +547,11 @@ trap 'rm -rf "$TMPDIR"' EXIT
 echo "Downloading $BINARY v$VERSION for $TARGET..."
 curl -fsSL "$URL" | tar xz -C "$TMPDIR"
 
-INSTALL_DIR="${{INSTALL_DIR:-/usr/local/bin}}"
+if [ -z "${{INSTALL_DIR:-}}" ]; then
+  printf "Install directory [/usr/local/bin]: "
+  read -r INSTALL_DIR
+  INSTALL_DIR="${{INSTALL_DIR:-/usr/local/bin}}"
+fi
 install -d "$INSTALL_DIR"
 install "$TMPDIR/$BINARY" "$INSTALL_DIR/$BINARY"
 echo "Installed $BINARY to $INSTALL_DIR/$BINARY"
@@ -894,6 +898,13 @@ mod tests {
         assert!(script.contains("Darwin)"));
         assert!(script.contains("x86_64|amd64)"));
         assert!(script.contains("arm64|aarch64)"));
+    }
+
+    #[test]
+    fn generate_install_script_prompts_for_install_dir() {
+        let script = generate_install_script("tool", "owner/repo", "1.0.0");
+        assert!(script.contains("printf \"Install directory [/usr/local/bin]: \""));
+        assert!(script.contains("read -r INSTALL_DIR"));
     }
 
     // --- nix_system tests ---

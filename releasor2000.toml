@@ -24,6 +24,6 @@ formula_name = "releasor2000"
 # [channels.cargo]
 crate_name = "releasor2000"
 
-# [channels.curl]
+[channels.curl]
 
 [channels.nix]
