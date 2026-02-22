@@ -14,12 +14,6 @@ targets = [
     "aarch64-unknown-linux-gnu",
 ]
 
-[git]
-# type = "gitea"                  # defaults to "github"
-# base_url = "https://git.example.com"
-# api_base_url = "https://git.example.com/api/v1"  # optional override
-# token_env = "GITEA_TOKEN"       # defaults: GITHUB_TOKEN or GITEA_TOKEN
-
 [channels.git]
 enabled = true
 

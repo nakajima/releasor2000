@@ -468,6 +468,25 @@ tap = "owner/homebrew-tap"
     }
 
     #[test]
+    fn git_channel_only_is_enabled() {
+        let toml = r#"
+[project]
+name = "myapp"
+repo = "owner/repo"
+
+[build]
+command = "make"
+artifact = "out/bin"
+targets = ["x86_64-apple-darwin"]
+
+[channels.git]
+enabled = true
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.enabled_channels(), vec!["git"]);
+    }
+
+    #[test]
     fn github_channel_is_rejected() {
         let toml = r#"
 [project]
@@ -613,6 +632,44 @@ flake_repo = "owner/nix-repo"
                 .formula_name
                 .as_deref(),
             Some("myapp")
+        );
+    }
+
+    #[test]
+    fn channels_git_is_enabled_in_realistic_example() {
+        let toml = r#"
+[project]
+name = "releasor2000"
+repo = "nakajima/releasor2000"
+
+[build]
+command = "cargo build --release --target {target}"
+artifact = "target/{target}/release/{binary}"
+targets = [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[channels.git]
+enabled = true
+
+[channels.homebrew]
+tap = "nakajima/homebrew-tap"
+formula_name = "releasor2000"
+
+# [channels.cargo]
+crate_name = "releasor2000"
+
+[channels.curl]
+
+[channels.nix]
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(
+            config.enabled_channels(),
+            vec!["git", "homebrew", "curl", "nix"]
         );
     }
 }
