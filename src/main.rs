@@ -56,7 +56,11 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Release { version, channels } => {
-            let channels = if channels.is_empty() { None } else { Some(channels) };
+            let channels = if channels.is_empty() {
+                None
+            } else {
+                Some(channels)
+            };
             channels::release(&config, version.as_deref(), channels.as_deref())
         }
     }

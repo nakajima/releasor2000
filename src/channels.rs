@@ -4,9 +4,69 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::Config;
+use crate::config::{Config, GitType};
 
 // --- Shared infrastructure ---
+
+#[derive(Debug, Clone)]
+struct GitContext {
+    web_base_url: String,
+    api_base_url: String,
+    token_env: String,
+    auth_prefix: &'static str,
+    accept_header: &'static str,
+    is_github: bool,
+}
+
+impl GitContext {
+    fn from_config(config: &Config) -> Self {
+        let (auth_prefix, accept_header, is_github) = match config.git.r#type {
+            GitType::Github => ("Bearer", "application/vnd.github+json", true),
+            GitType::Gitea => ("token", "application/json", false),
+        };
+        Self {
+            web_base_url: config.git.web_base_url(),
+            api_base_url: config.git.api_base_url(),
+            token_env: config.git.token_env().to_string(),
+            auth_prefix,
+            accept_header,
+            is_github,
+        }
+    }
+
+    fn token(&self) -> Result<String> {
+        std::env::var(&self.token_env)
+            .with_context(|| format!("{} environment variable not set", self.token_env))
+    }
+
+    fn auth_header(&self, token: &str) -> String {
+        format!("Authorization: {} {token}", self.auth_prefix)
+    }
+
+    fn repo_api_url(&self, repo: &str, suffix: &str) -> String {
+        format!("{}/repos/{repo}{suffix}", self.api_base_url)
+    }
+
+    fn contents_api_url(&self, repo: &str, path: &str) -> String {
+        self.repo_api_url(repo, &format!("/contents/{path}"))
+    }
+
+    fn release_download_url(&self, repo: &str, version: &str, asset_name: &str) -> String {
+        format!(
+            "{}/{repo}/releases/download/v{version}/{asset_name}",
+            self.web_base_url
+        )
+    }
+
+    fn upload_url_with_name(upload_url: &str, name: &str) -> String {
+        let base = upload_url.split('{').next().unwrap_or(upload_url);
+        if base.contains('?') {
+            format!("{base}&name={name}")
+        } else {
+            format!("{base}?name={name}")
+        }
+    }
+}
 
 fn run_cmd(label: &str, dir: Option<&Path>, cmd: &str, args: &[&str]) -> Result<String> {
     println!("[{label}] Running: {cmd} {}", args.join(" "));
@@ -25,24 +85,29 @@ fn run_cmd(label: &str, dir: Option<&Path>, cmd: &str, args: &[&str]) -> Result<
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn github_token() -> Result<String> {
-    std::env::var("GITHUB_TOKEN").context("GITHUB_TOKEN environment variable not set")
-}
-
-fn github_api(label: &str, method: &str, url: &str, json_body: Option<&str>) -> Result<serde_json::Value> {
-    let token = github_token()?;
-    let auth = format!("Authorization: Bearer {token}");
+fn git_api(
+    git: &GitContext,
+    label: &str,
+    method: &str,
+    url: &str,
+    json_body: Option<&str>,
+) -> Result<serde_json::Value> {
+    let token = git.token()?;
+    let auth = git.auth_header(&token);
+    let accept = format!("Accept: {}", git.accept_header);
     println!("[{label}] {method} {url}");
     let mut cmd = Command::new("curl");
     cmd.args(["-fsSL", "-X", method]);
-    cmd.args(["-H", "Accept: application/vnd.github+json"]);
+    cmd.args(["-H", &accept]);
     cmd.args(["-H", &auth]);
     if let Some(body) = json_body {
         cmd.args(["-H", "Content-Type: application/json"]);
         cmd.args(["-d", body]);
     }
     cmd.arg(url);
-    let output = cmd.output().with_context(|| format!("[{label}] failed to run curl"))?;
+    let output = cmd
+        .output()
+        .with_context(|| format!("[{label}] failed to run curl"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("[{label}] API request failed: {stderr}");
@@ -51,24 +116,40 @@ fn github_api(label: &str, method: &str, url: &str, json_body: Option<&str>) -> 
     if stdout.trim().is_empty() {
         return Ok(serde_json::Value::Null);
     }
-    serde_json::from_str(stdout.trim()).with_context(|| format!("[{label}] failed to parse API response"))
+    serde_json::from_str(stdout.trim())
+        .with_context(|| format!("[{label}] failed to parse API response"))
 }
 
-fn github_upload_asset(label: &str, upload_url: &str, file_path: &Path, name: &str, content_type: &str) -> Result<()> {
-    let token = github_token()?;
-    let auth = format!("Authorization: Bearer {token}");
+fn git_upload_asset(
+    git: &GitContext,
+    label: &str,
+    upload_url: &str,
+    file_path: &Path,
+    name: &str,
+    content_type: &str,
+) -> Result<()> {
+    let token = git.token()?;
+    let auth = git.auth_header(&token);
+    let accept = format!("Accept: {}", git.accept_header);
     let ct = format!("Content-Type: {content_type}");
-    let url = format!("{upload_url}?name={name}");
+    let url = GitContext::upload_url_with_name(upload_url, name);
     let data_arg = format!("@{}", file_path.to_string_lossy());
+    let attach_arg = format!("attachment=@{}", file_path.to_string_lossy());
     println!("[{label}] Uploading {name}");
     let mut cmd = Command::new("curl");
     cmd.args(["-fsSL", "-X", "POST"]);
-    cmd.args(["-H", "Accept: application/vnd.github+json"]);
+    cmd.args(["-H", &accept]);
     cmd.args(["-H", &auth]);
-    cmd.args(["-H", &ct]);
-    cmd.args(["--data-binary", &data_arg]);
+    if git.is_github {
+        cmd.args(["-H", &ct]);
+        cmd.args(["--data-binary", &data_arg]);
+    } else {
+        cmd.args(["-F", &attach_arg]);
+    }
     cmd.arg(&url);
-    let output = cmd.output().with_context(|| format!("[{label}] failed to upload {name}"))?;
+    let output = cmd
+        .output()
+        .with_context(|| format!("[{label}] failed to upload {name}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("[{label}] upload of {name} failed: {stderr}");
@@ -93,8 +174,7 @@ fn detect_version(config: &Config, version_override: Option<&str>) -> Result<Str
         let (bin, args) = parts
             .split_first()
             .ok_or_else(|| anyhow::anyhow!("empty version_command"))?;
-        run_cmd("version", None, bin, args)
-            .context("version_command failed")?
+        run_cmd("version", None, bin, args).context("version_command failed")?
     } else {
         run_cmd("version", None, "git", &["describe", "--tags", "--abbrev=0"])
             .context("could not detect version from git tags — use --version or set version_command in config")?
@@ -144,7 +224,11 @@ fn has_cargo_zigbuild() -> bool {
 }
 
 fn parse_installed_targets(output: &str) -> HashSet<String> {
-    output.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
+    output
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 fn installed_targets() -> HashSet<String> {
@@ -211,7 +295,10 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
         };
 
         if !artifact_path.exists() {
-            eprintln!("[build] Warning: target {target} failed: artifact not found at {}", artifact_path.display());
+            eprintln!(
+                "[build] Warning: target {target} failed: artifact not found at {}",
+                artifact_path.display()
+            );
             failed.push(target.clone());
             continue;
         }
@@ -219,9 +306,7 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
         let archive_name = format!("{binary}-{version}-{target}.tar.gz");
         let archive_path = staging.join(&archive_name);
 
-        let artifact_dir = artifact_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
+        let artifact_dir = artifact_path.parent().unwrap_or_else(|| Path::new("."));
         let artifact_file = artifact_path
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("artifact has no filename"))?
@@ -231,7 +316,14 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
             "build",
             Some(artifact_dir),
             "tar",
-            &["czf", &archive_path.canonicalize().unwrap_or(std::fs::canonicalize(&staging)?.join(&archive_name)).to_string_lossy(), &artifact_file],
+            &[
+                "czf",
+                &archive_path
+                    .canonicalize()
+                    .unwrap_or(std::fs::canonicalize(&staging)?.join(&archive_name))
+                    .to_string_lossy(),
+                &artifact_file,
+            ],
         )?;
 
         archives.push((target.clone(), archive_path));
@@ -242,11 +334,20 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
     }
 
     if !failed.is_empty() {
-        eprintln!("\n{}/{} targets failed:", failed.len(), config.build.targets.len());
+        eprintln!(
+            "\n{}/{} targets failed:",
+            failed.len(),
+            config.build.targets.len()
+        );
         for t in &failed {
             eprintln!("  - {t}");
         }
-        if config.build.command.as_ref().is_some_and(|c| c.contains("cargo")) {
+        if config
+            .build
+            .command
+            .as_ref()
+            .is_some_and(|c| c.contains("cargo"))
+        {
             let installed = installed_targets();
             let (installed_failed, missing): (Vec<_>, Vec<_>) =
                 failed.iter().partition(|t| installed.contains(t.as_str()));
@@ -262,7 +363,9 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
                 for t in &installed_failed {
                     eprintln!("  - {t}");
                 }
-                eprintln!("  Tip: install `cross` (uses Docker) or `cargo-zigbuild` (uses zig) for cross-compilation");
+                eprintln!(
+                    "  Tip: install `cross` (uses Docker) or `cargo-zigbuild` (uses zig) for cross-compilation"
+                );
             }
         }
         if config.build.pre_built_dir.is_some() {
@@ -317,31 +420,38 @@ fn command_exists(cmd: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-fn preflight(selected: &[&str]) -> Result<()> {
+fn preflight(git: &GitContext, selected: &[&str]) -> Result<()> {
     let mut missing = Vec::new();
 
-    let needs_github_api = selected.iter().any(|ch| matches!(*ch, "github" | "homebrew" | "curl" | "nix"));
+    let needs_git_api = selected
+        .iter()
+        .any(|ch| matches!(*ch, "git" | "homebrew" | "curl" | "nix"));
 
-    if needs_github_api {
-        if std::env::var("GITHUB_TOKEN").is_err() {
-            missing.push("GITHUB_TOKEN env var is required for: github, homebrew, curl, nix");
+    if needs_git_api {
+        if std::env::var(&git.token_env).is_err() {
+            missing.push(format!(
+                "{} env var is required for: git, homebrew, curl, nix",
+                git.token_env
+            ));
         }
         if !command_exists("curl") {
-            missing.push("curl command is required for: github, homebrew, curl, nix");
+            missing.push("curl command is required for: git, homebrew, curl, nix".to_string());
         }
     }
 
     if selected.contains(&"nix") && !command_exists("nix") {
-        missing.push("nix command is required for: nix");
+        missing.push("nix command is required for: nix".to_string());
     }
 
     if selected.contains(&"cargo") && !command_exists("cargo") {
-        missing.push("cargo command is required for: cargo");
+        missing.push("cargo command is required for: cargo".to_string());
     }
 
-    let depends_on_github = selected.iter().any(|ch| matches!(*ch, "homebrew" | "curl" | "nix"));
-    if depends_on_github && !selected.contains(&"github") {
-        missing.push("github channel must be selected when using: homebrew, curl, nix");
+    let depends_on_git = selected
+        .iter()
+        .any(|ch| matches!(*ch, "homebrew" | "curl" | "nix"));
+    if depends_on_git && !selected.contains(&"git") {
+        missing.push("git channel must be selected when using: homebrew, curl, nix".to_string());
     }
 
     if !missing.is_empty() {
@@ -353,16 +463,24 @@ fn preflight(selected: &[&str]) -> Result<()> {
 
 // --- Public entry point ---
 
-const KNOWN_CHANNELS: &[&str] = &["github", "homebrew", "cargo", "curl", "nix"];
+const KNOWN_CHANNELS: &[&str] = &["git", "homebrew", "cargo", "curl", "nix"];
 
-pub fn release(config: &Config, version_override: Option<&str>, channels: Option<&[String]>) -> Result<()> {
+pub fn release(
+    config: &Config,
+    version_override: Option<&str>,
+    channels: Option<&[String]>,
+) -> Result<()> {
     let enabled = config.enabled_channels();
+    let git = GitContext::from_config(config);
 
     let selected: Vec<&str> = match channels {
         Some(requested) => {
             for ch in requested {
                 if !KNOWN_CHANNELS.contains(&ch.as_str()) {
-                    bail!("unknown channel: {ch} (known: {})", KNOWN_CHANNELS.join(", "));
+                    bail!(
+                        "unknown channel: {ch} (known: {})",
+                        KNOWN_CHANNELS.join(", ")
+                    );
                 }
                 if !enabled.contains(&ch.as_str()) {
                     bail!("channel {ch} is not enabled in config");
@@ -378,7 +496,7 @@ pub fn release(config: &Config, version_override: Option<&str>, channels: Option
         return Ok(());
     }
 
-    preflight(&selected)?;
+    preflight(&git, &selected)?;
 
     let version = detect_version(config, version_override)?;
     println!(
@@ -389,14 +507,14 @@ pub fn release(config: &Config, version_override: Option<&str>, channels: Option
 
     let archives = build_artifacts(config, &version)?;
 
-    // Run github first so other channels can reference release URLs
+    // Run git first so other channels can reference release URLs
     let ordered: Vec<&str> = {
         let mut v = Vec::new();
-        if selected.contains(&"github") {
-            v.push("github");
+        if selected.contains(&"git") {
+            v.push("git");
         }
         for ch in &selected {
-            if *ch != "github" {
+            if *ch != "git" {
                 v.push(ch);
             }
         }
@@ -405,11 +523,11 @@ pub fn release(config: &Config, version_override: Option<&str>, channels: Option
 
     for channel in &ordered {
         match *channel {
-            "github" => release_github(config, &version, &archives)?,
-            "homebrew" => release_homebrew(config, &version, &archives)?,
+            "git" => release_git(config, &git, &version, &archives)?,
+            "homebrew" => release_homebrew(config, &git, &version, &archives)?,
             "cargo" => release_cargo(config)?,
-            "curl" => release_curl(config, &version)?,
-            "nix" => release_nix(config, &version, &archives)?,
+            "curl" => release_curl(config, &git, &version)?,
+            "nix" => release_nix(config, &git, &version, &archives)?,
             _ => unreachable!(),
         }
     }
@@ -420,33 +538,58 @@ pub fn release(config: &Config, version_override: Option<&str>, channels: Option
 
 // --- Channel implementations ---
 
-fn create_github_release(repo: &str, version: &str) -> Result<String> {
-    let url = format!("https://api.github.com/repos/{repo}/releases");
-    let body = serde_json::json!({
-        "tag_name": format!("v{version}"),
-        "name": format!("v{version}"),
-        "generate_release_notes": true,
-    });
-    let resp = github_api("github", "POST", &url, Some(&body.to_string()))?;
-    let upload_url = resp["upload_url"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("[github] missing upload_url in response"))?;
-    // Strip the {?name,label} URI template suffix
-    Ok(upload_url.split('{').next().unwrap_or(upload_url).to_string())
+fn release_upload_url(
+    git: &GitContext,
+    channel: &str,
+    repo: &str,
+    release: &serde_json::Value,
+) -> Result<String> {
+    if let Some(upload_url) = release["upload_url"].as_str() {
+        return Ok(upload_url.to_string());
+    }
+    // Older Gitea releases may omit upload_url in the response.
+    if let Some(release_id) = release["id"].as_i64() {
+        return Ok(git.repo_api_url(repo, &format!("/releases/{release_id}/assets")));
+    }
+    bail!("[{channel}] missing upload_url/id in release response");
 }
 
-fn release_github(config: &Config, version: &str, archives: &[(String, PathBuf)]) -> Result<()> {
-    let upload_url = create_github_release(&config.project.repo, version)?;
+fn create_release(git: &GitContext, repo: &str, version: &str) -> Result<String> {
+    let url = git.repo_api_url(repo, "/releases");
+    let body = if git.is_github {
+        serde_json::json!({
+            "tag_name": format!("v{version}"),
+            "name": format!("v{version}"),
+            "generate_release_notes": true,
+        })
+    } else {
+        serde_json::json!({
+            "tag_name": format!("v{version}"),
+            "name": format!("v{version}"),
+        })
+    };
+    let resp = git_api(git, "git", "POST", &url, Some(&body.to_string()))?;
+    release_upload_url(git, "git", repo, &resp)
+}
+
+fn release_git(
+    config: &Config,
+    git: &GitContext,
+    version: &str,
+    archives: &[(String, PathBuf)],
+) -> Result<()> {
+    let upload_url = create_release(git, &config.project.repo, version)?;
     for (_, path) in archives {
         let name = path.file_name().unwrap().to_string_lossy();
-        github_upload_asset("github", &upload_url, path, &name, "application/gzip")?;
+        git_upload_asset(git, "git", &upload_url, path, &name, "application/gzip")?;
     }
-    println!("[github] Created release v{version}");
+    println!("[git] Created release v{version}");
     Ok(())
 }
 
 fn release_homebrew(
     config: &Config,
+    git: &GitContext,
     version: &str,
     archives: &[(String, PathBuf)],
 ) -> Result<()> {
@@ -455,9 +598,10 @@ fn release_homebrew(
     let binary = config.project.binary();
     let repo = &config.project.repo;
 
-    let release_url = format!("https://api.github.com/repos/{repo}/releases/tags/v{version}");
-    github_api("homebrew", "GET", &release_url, None)
-        .with_context(|| format!("[homebrew] GitHub release v{version} not found — run the github channel first"))?;
+    let release_url = git.repo_api_url(repo, &format!("/releases/tags/v{version}"));
+    git_api(git, "homebrew", "GET", &release_url, None).with_context(|| {
+        format!("[homebrew] release v{version} not found — run the git channel first")
+    })?;
 
     let mut darwin_arm_sha = String::new();
     let mut darwin_intel_sha = String::new();
@@ -470,13 +614,21 @@ fn release_homebrew(
         }
     }
 
-    let formula = generate_formula(formula_name, binary, repo, version, &darwin_arm_sha, &darwin_intel_sha);
+    let formula = generate_formula(
+        formula_name,
+        binary,
+        repo,
+        version,
+        &darwin_arm_sha,
+        &darwin_intel_sha,
+        &git.web_base_url,
+    );
 
     let file_path = format!("Formula/{formula_name}.rb");
-    let api_url = format!("https://api.github.com/repos/{}/contents/{}", ch.tap, file_path);
+    let api_url = git.contents_api_url(&ch.tap, &file_path);
 
     // Get current file SHA if it exists (required for updates)
-    let existing_sha = github_api("homebrew", "GET", &api_url, None)
+    let existing_sha = git_api(git, "homebrew", "GET", &api_url, None)
         .ok()
         .and_then(|resp| resp["sha"].as_str().map(|s| s.to_string()));
 
@@ -488,7 +640,7 @@ fn release_homebrew(
         body["sha"] = serde_json::Value::String(sha);
     }
 
-    github_api("homebrew", "PUT", &api_url, Some(&body.to_string()))?;
+    git_api(git, "homebrew", "PUT", &api_url, Some(&body.to_string()))?;
     println!("[homebrew] Updated formula {formula_name} in {}", ch.tap);
     Ok(())
 }
@@ -500,21 +652,22 @@ fn generate_formula(
     version: &str,
     arm_sha: &str,
     intel_sha: &str,
+    web_base_url: &str,
 ) -> String {
     let class_name = to_pascal_case(name);
     format!(
         r#"class {class_name} < Formula
   desc "{name}"
-  homepage "https://github.com/{repo}"
+  homepage "{web_base_url}/{repo}"
   version "{version}"
 
   on_macos do
     on_arm do
-      url "https://github.com/{repo}/releases/download/v{version}/{binary}-{version}-aarch64-apple-darwin.tar.gz"
+      url "{web_base_url}/{repo}/releases/download/v{version}/{binary}-{version}-aarch64-apple-darwin.tar.gz"
       sha256 "{arm_sha}"
     end
     on_intel do
-      url "https://github.com/{repo}/releases/download/v{version}/{binary}-{version}-x86_64-apple-darwin.tar.gz"
+      url "{web_base_url}/{repo}/releases/download/v{version}/{binary}-{version}-x86_64-apple-darwin.tar.gz"
       sha256 "{intel_sha}"
     end
   end
@@ -535,29 +688,35 @@ fn release_cargo(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn release_curl(config: &Config, version: &str) -> Result<()> {
+fn release_curl(config: &Config, git: &GitContext, version: &str) -> Result<()> {
     let binary = config.project.binary();
     let repo = &config.project.repo;
 
-    let script = generate_install_script(binary, repo, version);
+    let script = generate_install_script(binary, repo, version, &git.web_base_url);
 
     let script_path = PathBuf::from("target/release-staging/install.sh");
     std::fs::write(&script_path, &script)?;
 
     // Get the release to find its upload URL
-    let url = format!("https://api.github.com/repos/{repo}/releases/tags/v{version}");
-    let resp = github_api("curl", "GET", &url, None)?;
-    let upload_url = resp["upload_url"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("[curl] could not find release v{version} — is the github channel enabled?"))?;
-    let upload_url = upload_url.split('{').next().unwrap_or(upload_url);
+    let url = git.repo_api_url(repo, &format!("/releases/tags/v{version}"));
+    let resp = git_api(git, "curl", "GET", &url, None)?;
+    let upload_url = release_upload_url(git, "curl", repo, &resp).map_err(|_| {
+        anyhow::anyhow!("[curl] could not find release v{version} — is the git channel enabled?")
+    })?;
 
-    github_upload_asset("curl", upload_url, &script_path, "install.sh", "text/plain")?;
+    git_upload_asset(
+        git,
+        "curl",
+        &upload_url,
+        &script_path,
+        "install.sh",
+        "text/plain",
+    )?;
     println!("[curl] Uploaded install.sh to release v{version}");
     Ok(())
 }
 
-fn generate_install_script(binary: &str, repo: &str, version: &str) -> String {
+fn generate_install_script(binary: &str, repo: &str, version: &str, web_base_url: &str) -> String {
     format!(
         r#"#!/bin/sh
 set -eu
@@ -565,6 +724,7 @@ set -eu
 BINARY="{binary}"
 REPO="{repo}"
 VERSION="{version}"
+RELEASE_BASE_URL="{web_base_url}"
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
@@ -582,7 +742,7 @@ case "$ARCH" in
 esac
 
 TARGET="${{ARCH_TARGET}}-${{OS_TARGET}}"
-URL="https://github.com/${{REPO}}/releases/download/v${{VERSION}}/${{BINARY}}-${{VERSION}}-${{TARGET}}.tar.gz"
+URL="${{RELEASE_BASE_URL}}/${{REPO}}/releases/download/v${{VERSION}}/${{BINARY}}-${{VERSION}}-${{TARGET}}.tar.gz"
 
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
@@ -622,6 +782,7 @@ fn generate_flake(
     repo: &str,
     version: &str,
     system_hashes: &[(&str, &str, &str)],
+    web_base_url: &str,
 ) -> String {
     let pkg_entries: Vec<String> = system_hashes
         .iter()
@@ -632,7 +793,7 @@ fn generate_flake(
           pname = "BINARY";
           version = "VERSION";
           src = pkgs.fetchurl {
-            url = "https://github.com/REPO/releases/download/vVERSION/BINARY-VERSION-RUSTTARGET.tar.gz";
+            url = "BASEURL/REPO/releases/download/vVERSION/BINARY-VERSION-RUSTTARGET.tar.gz";
             sha256 = "SHA256HEX";
           };
           sourceRoot = ".";
@@ -647,6 +808,7 @@ fn generate_flake(
                 .replace("SHA256HEX", sha256_hex)
                 .replace("BINARY", binary)
                 .replace("REPO", repo)
+                .replace("BASEURL", web_base_url)
                 .replace("VERSION", version)
         })
         .collect();
@@ -671,6 +833,7 @@ PKGENTRIES
 
 fn release_nix(
     config: &Config,
+    git: &GitContext,
     version: &str,
     archives: &[(String, PathBuf)],
 ) -> Result<()> {
@@ -679,10 +842,11 @@ fn release_nix(
     let repo = &config.project.repo;
     let flake_repo = ch.flake_repo.as_deref().unwrap_or(repo);
 
-    // Download release assets from GitHub and hash them (local archives may differ)
-    let release_url = format!("https://api.github.com/repos/{repo}/releases/tags/v{version}");
-    let release = github_api("nix", "GET", &release_url, None)
-        .with_context(|| format!("[nix] GitHub release v{version} not found — run the github channel first"))?;
+    // Download release assets from git release and hash them (local archives may differ)
+    let release_url = git.repo_api_url(repo, &format!("/releases/tags/v{version}"));
+    let release = git_api(git, "nix", "GET", &release_url, None).with_context(|| {
+        format!("[nix] release v{version} not found — run the git channel first")
+    })?;
 
     let staging = PathBuf::from("target/release-staging");
     std::fs::create_dir_all(&staging)?;
@@ -694,14 +858,13 @@ fn release_nix(
             None => continue,
         };
         let asset_name = format!("{binary}-{version}-{target}.tar.gz");
-        let download_url = format!(
-            "https://github.com/{repo}/releases/download/v{version}/{asset_name}"
-        );
+        let download_url = git.release_download_url(repo, version, &asset_name);
 
         // Verify asset exists in the release
         let assets = release["assets"].as_array();
         let asset_exists = assets.is_some_and(|a| {
-            a.iter().any(|asset| asset["name"].as_str() == Some(&asset_name))
+            a.iter()
+                .any(|asset| asset["name"].as_str() == Some(&asset_name))
         });
         if !asset_exists {
             eprintln!("[nix] Warning: asset {asset_name} not found in release, skipping");
@@ -709,7 +872,12 @@ fn release_nix(
         }
 
         let tmp_path = staging.join(format!("nix-{asset_name}"));
-        run_cmd("nix", None, "curl", &["-fsSL", "-o", &tmp_path.to_string_lossy(), &download_url])?;
+        run_cmd(
+            "nix",
+            None,
+            "curl",
+            &["-fsSL", "-o", &tmp_path.to_string_lossy(), &download_url],
+        )?;
         let hash = sha256(&tmp_path)?;
         std::fs::remove_file(&tmp_path).ok();
         system_hashes.push((nix_sys, target.as_str(), hash));
@@ -720,15 +888,19 @@ fn release_nix(
         .map(|(s, t, h)| (*s, *t, h.as_str()))
         .collect();
 
-    let flake = generate_flake(binary, binary, repo, version, &system_hash_refs);
+    let flake = generate_flake(
+        binary,
+        binary,
+        repo,
+        version,
+        &system_hash_refs,
+        &git.web_base_url,
+    );
 
     // Push file via Contents API, returns Ok(true) if pushed, Ok(false) if skipped
     let push_file = |file: &str, content: &str, msg: &str| -> Result<()> {
-        let api_url = format!(
-            "https://api.github.com/repos/{}/contents/{}",
-            flake_repo, file
-        );
-        let existing_sha = github_api("nix", "GET", &api_url, None)
+        let api_url = git.contents_api_url(flake_repo, file);
+        let existing_sha = git_api(git, "nix", "GET", &api_url, None)
             .ok()
             .and_then(|resp| resp["sha"].as_str().map(|s| s.to_string()));
         let mut body = serde_json::json!({
@@ -738,7 +910,7 @@ fn release_nix(
         if let Some(sha) = existing_sha {
             body["sha"] = serde_json::Value::String(sha);
         }
-        github_api("nix", "PUT", &api_url, Some(&body.to_string()))?;
+        git_api(git, "nix", "PUT", &api_url, Some(&body.to_string()))?;
         Ok(())
     };
 
@@ -752,8 +924,16 @@ fn release_nix(
         .context("[nix] failed to read generated flake.lock")?;
     std::fs::remove_dir_all(&tmp_dir).ok();
 
-    push_file("flake.nix", &flake, &format!("Update {binary} to {version}"))?;
-    push_file("flake.lock", &flake_lock, &format!("Update flake.lock for {binary} {version}"))?;
+    push_file(
+        "flake.nix",
+        &flake,
+        &format!("Update {binary} to {version}"),
+    )?;
+    push_file(
+        "flake.lock",
+        &flake_lock,
+        &format!("Update flake.lock for {binary} {version}"),
+    )?;
     println!("[nix] Updated flake.nix and flake.lock in {flake_repo}");
     Ok(())
 }
@@ -761,6 +941,19 @@ fn release_nix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GITHUB_BASE_URL: &str = "https://github.com";
+
+    fn github_git() -> GitContext {
+        GitContext {
+            web_base_url: GITHUB_BASE_URL.to_string(),
+            api_base_url: "https://api.github.com".to_string(),
+            token_env: "GITHUB_TOKEN".to_string(),
+            auth_prefix: "Bearer",
+            accept_header: "application/vnd.github+json",
+            is_github: true,
+        }
+    }
 
     // --- substitute tests ---
 
@@ -803,19 +996,43 @@ mod tests {
 
     #[test]
     fn generate_formula_correct_class_name() {
-        let formula = generate_formula("my-tool", "my-tool", "owner/repo", "1.0.0", "abc", "def");
+        let formula = generate_formula(
+            "my-tool",
+            "my-tool",
+            "owner/repo",
+            "1.0.0",
+            "abc",
+            "def",
+            GITHUB_BASE_URL,
+        );
         assert!(formula.starts_with("class MyTool < Formula"));
     }
 
     #[test]
     fn generate_formula_contains_version() {
-        let formula = generate_formula("tool", "tool", "owner/repo", "2.3.4", "abc", "def");
+        let formula = generate_formula(
+            "tool",
+            "tool",
+            "owner/repo",
+            "2.3.4",
+            "abc",
+            "def",
+            GITHUB_BASE_URL,
+        );
         assert!(formula.contains("version \"2.3.4\""));
     }
 
     #[test]
     fn generate_formula_contains_arch_blocks() {
-        let formula = generate_formula("tool", "tool", "owner/repo", "1.0.0", "armsha", "intelsha");
+        let formula = generate_formula(
+            "tool",
+            "tool",
+            "owner/repo",
+            "1.0.0",
+            "armsha",
+            "intelsha",
+            GITHUB_BASE_URL,
+        );
         assert!(formula.contains("on_macos do"));
         assert!(formula.contains("on_arm do"));
         assert!(formula.contains("on_intel do"));
@@ -825,15 +1042,45 @@ mod tests {
 
     #[test]
     fn generate_formula_contains_download_urls() {
-        let formula = generate_formula("tool", "tool", "owner/repo", "1.0.0", "a", "b");
+        let formula = generate_formula(
+            "tool",
+            "tool",
+            "owner/repo",
+            "1.0.0",
+            "a",
+            "b",
+            GITHUB_BASE_URL,
+        );
         assert!(formula.contains("https://github.com/owner/repo/releases/download/v1.0.0/tool-1.0.0-aarch64-apple-darwin.tar.gz"));
         assert!(formula.contains("https://github.com/owner/repo/releases/download/v1.0.0/tool-1.0.0-x86_64-apple-darwin.tar.gz"));
     }
 
     #[test]
     fn generate_formula_contains_binary_install() {
-        let formula = generate_formula("tool", "mybinary", "owner/repo", "1.0.0", "a", "b");
+        let formula = generate_formula(
+            "tool",
+            "mybinary",
+            "owner/repo",
+            "1.0.0",
+            "a",
+            "b",
+            GITHUB_BASE_URL,
+        );
         assert!(formula.contains("bin.install \"mybinary\""));
+    }
+
+    #[test]
+    fn generate_formula_supports_custom_base_url() {
+        let formula = generate_formula(
+            "tool",
+            "tool",
+            "owner/repo",
+            "1.0.0",
+            "a",
+            "b",
+            "https://git.example.com",
+        );
+        assert!(formula.contains("https://git.example.com/owner/repo/releases/download"));
     }
 
     // --- parse_host_target tests ---
@@ -917,21 +1164,22 @@ mod tests {
 
     #[test]
     fn generate_install_script_starts_with_shebang() {
-        let script = generate_install_script("tool", "owner/repo", "1.0.0");
+        let script = generate_install_script("tool", "owner/repo", "1.0.0", GITHUB_BASE_URL);
         assert!(script.starts_with("#!/bin/sh"));
     }
 
     #[test]
     fn generate_install_script_contains_repo_binary_version() {
-        let script = generate_install_script("mytool", "cool/repo", "3.2.1");
+        let script = generate_install_script("mytool", "cool/repo", "3.2.1", GITHUB_BASE_URL);
         assert!(script.contains("BINARY=\"mytool\""));
         assert!(script.contains("REPO=\"cool/repo\""));
         assert!(script.contains("VERSION=\"3.2.1\""));
+        assert!(script.contains("RELEASE_BASE_URL=\"https://github.com\""));
     }
 
     #[test]
     fn generate_install_script_handles_all_arch_os_combos() {
-        let script = generate_install_script("tool", "owner/repo", "1.0.0");
+        let script = generate_install_script("tool", "owner/repo", "1.0.0", GITHUB_BASE_URL);
         assert!(script.contains("Linux)"));
         assert!(script.contains("Darwin)"));
         assert!(script.contains("x86_64|amd64)"));
@@ -940,7 +1188,7 @@ mod tests {
 
     #[test]
     fn generate_install_script_prompts_for_install_dir() {
-        let script = generate_install_script("tool", "owner/repo", "1.0.0");
+        let script = generate_install_script("tool", "owner/repo", "1.0.0", GITHUB_BASE_URL);
         assert!(script.contains("printf \"Install directory [/usr/local/bin]: \""));
         assert!(script.contains("read -r INSTALL_DIR"));
     }
@@ -954,7 +1202,10 @@ mod tests {
 
     #[test]
     fn nix_system_aarch64_linux() {
-        assert_eq!(nix_system("aarch64-unknown-linux-gnu"), Some("aarch64-linux"));
+        assert_eq!(
+            nix_system("aarch64-unknown-linux-gnu"),
+            Some("aarch64-linux")
+        );
     }
 
     #[test]
@@ -976,76 +1227,148 @@ mod tests {
 
     #[test]
     fn generate_flake_contains_description() {
-        let flake = generate_flake("mytool", "mytool", "owner/repo", "1.0.0", &[
-            ("x86_64-linux", "x86_64-unknown-linux-gnu", "abc123"),
-        ]);
+        let flake = generate_flake(
+            "mytool",
+            "mytool",
+            "owner/repo",
+            "1.0.0",
+            &[("x86_64-linux", "x86_64-unknown-linux-gnu", "abc123")],
+            GITHUB_BASE_URL,
+        );
         assert!(flake.contains(r#"description = "mytool""#));
     }
 
     #[test]
     fn generate_flake_contains_version() {
-        let flake = generate_flake("mytool", "mytool", "owner/repo", "2.3.4", &[
-            ("x86_64-linux", "x86_64-unknown-linux-gnu", "abc123"),
-        ]);
+        let flake = generate_flake(
+            "mytool",
+            "mytool",
+            "owner/repo",
+            "2.3.4",
+            &[("x86_64-linux", "x86_64-unknown-linux-gnu", "abc123")],
+            GITHUB_BASE_URL,
+        );
         assert!(flake.contains(r#"version = "2.3.4""#));
     }
 
     #[test]
     fn generate_flake_contains_sha256_values() {
-        let flake = generate_flake("mytool", "mytool", "owner/repo", "1.0.0", &[
-            ("x86_64-linux", "x86_64-unknown-linux-gnu", "deadbeef"),
-            ("aarch64-darwin", "aarch64-apple-darwin", "cafebabe"),
-        ]);
+        let flake = generate_flake(
+            "mytool",
+            "mytool",
+            "owner/repo",
+            "1.0.0",
+            &[
+                ("x86_64-linux", "x86_64-unknown-linux-gnu", "deadbeef"),
+                ("aarch64-darwin", "aarch64-apple-darwin", "cafebabe"),
+            ],
+            GITHUB_BASE_URL,
+        );
         assert!(flake.contains(r#""deadbeef""#));
         assert!(flake.contains(r#""cafebabe""#));
     }
 
     #[test]
     fn generate_flake_contains_binary_name() {
-        let flake = generate_flake("mytool", "mybinary", "owner/repo", "1.0.0", &[
-            ("x86_64-linux", "x86_64-unknown-linux-gnu", "abc"),
-        ]);
+        let flake = generate_flake(
+            "mytool",
+            "mybinary",
+            "owner/repo",
+            "1.0.0",
+            &[("x86_64-linux", "x86_64-unknown-linux-gnu", "abc")],
+            GITHUB_BASE_URL,
+        );
         assert!(flake.contains(r#"pname = "mybinary""#));
         assert!(flake.contains("install -m755 -D mybinary $out/bin/mybinary"));
     }
 
     #[test]
     fn generate_flake_contains_download_urls() {
-        let flake = generate_flake("mytool", "mytool", "owner/repo", "1.0.0", &[
-            ("x86_64-linux", "x86_64-unknown-linux-gnu", "abc"),
-            ("aarch64-darwin", "aarch64-apple-darwin", "def"),
-        ]);
-        assert!(flake.contains("https://github.com/owner/repo/releases/download/v1.0.0/mytool-1.0.0-"));
+        let flake = generate_flake(
+            "mytool",
+            "mytool",
+            "owner/repo",
+            "1.0.0",
+            &[
+                ("x86_64-linux", "x86_64-unknown-linux-gnu", "abc"),
+                ("aarch64-darwin", "aarch64-apple-darwin", "def"),
+            ],
+            GITHUB_BASE_URL,
+        );
+        assert!(
+            flake.contains("https://github.com/owner/repo/releases/download/v1.0.0/mytool-1.0.0-")
+        );
     }
 
     #[test]
     fn generate_flake_contains_system_entries() {
-        let flake = generate_flake("mytool", "mytool", "owner/repo", "1.0.0", &[
-            ("x86_64-linux", "x86_64-unknown-linux-gnu", "abc"),
-            ("aarch64-darwin", "aarch64-apple-darwin", "def"),
-        ]);
+        let flake = generate_flake(
+            "mytool",
+            "mytool",
+            "owner/repo",
+            "1.0.0",
+            &[
+                ("x86_64-linux", "x86_64-unknown-linux-gnu", "abc"),
+                ("aarch64-darwin", "aarch64-apple-darwin", "def"),
+            ],
+            GITHUB_BASE_URL,
+        );
         assert!(flake.contains(r#""x86_64-linux" = let"#));
         assert!(flake.contains(r#""aarch64-darwin" = let"#));
+    }
+
+    #[test]
+    fn generate_flake_supports_custom_base_url() {
+        let flake = generate_flake(
+            "mytool",
+            "mytool",
+            "owner/repo",
+            "1.0.0",
+            &[("x86_64-linux", "x86_64-unknown-linux-gnu", "abc")],
+            "https://git.example.com",
+        );
+        assert!(flake.contains("https://git.example.com/owner/repo/releases/download"));
     }
 
     // --- preflight tests ---
 
     #[test]
     fn preflight_ok_with_no_channels() {
-        assert!(preflight(&[]).is_ok());
+        let git = github_git();
+        assert!(preflight(&git, &[]).is_ok());
     }
 
     #[test]
-    fn preflight_requires_github_token() {
+    fn preflight_requires_default_github_token() {
         // Remove GITHUB_TOKEN to ensure the check triggers
         let saved = std::env::var("GITHUB_TOKEN").ok();
         unsafe { std::env::remove_var("GITHUB_TOKEN") };
 
-        let err = preflight(&["github"]).unwrap_err();
+        let git = github_git();
+        let err = preflight(&git, &["git"]).unwrap_err();
         assert!(err.to_string().contains("GITHUB_TOKEN"), "got: {err}");
 
         if let Some(val) = saved {
             unsafe { std::env::set_var("GITHUB_TOKEN", val) };
+        }
+    }
+
+    #[test]
+    fn preflight_uses_git_token_env_name() {
+        let saved = std::env::var("GITEA_TOKEN").ok();
+        unsafe { std::env::remove_var("GITEA_TOKEN") };
+        let git = GitContext {
+            web_base_url: "https://git.example.com".to_string(),
+            api_base_url: "https://git.example.com/api/v1".to_string(),
+            token_env: "GITEA_TOKEN".to_string(),
+            auth_prefix: "token",
+            accept_header: "application/json",
+            is_github: false,
+        };
+        let err = preflight(&git, &["git"]).unwrap_err();
+        assert!(err.to_string().contains("GITEA_TOKEN"), "got: {err}");
+        if let Some(val) = saved {
+            unsafe { std::env::set_var("GITEA_TOKEN", val) };
         }
     }
 
@@ -1062,7 +1385,8 @@ mod tests {
         let saved = std::env::var("GITHUB_TOKEN").ok();
         unsafe { std::env::set_var("GITHUB_TOKEN", "fake-token-for-test") };
 
-        let err = preflight(&["github", "nix"]).unwrap_err();
+        let git = github_git();
+        let err = preflight(&git, &["git", "nix"]).unwrap_err();
         assert!(err.to_string().contains("nix command"), "got: {err}");
 
         match saved {
@@ -1072,15 +1396,16 @@ mod tests {
     }
 
     #[test]
-    fn preflight_requires_github_for_dependent_channels() {
+    fn preflight_requires_git_for_dependent_channels() {
         // Ensure GITHUB_TOKEN is set so only the dependency check triggers
         let saved = std::env::var("GITHUB_TOKEN").ok();
         unsafe { std::env::set_var("GITHUB_TOKEN", "fake-token-for-test") };
 
+        let git = github_git();
         for ch in &["homebrew", "curl", "nix"] {
-            let err = preflight(&[ch]).unwrap_err();
+            let err = preflight(&git, &[*ch]).unwrap_err();
             assert!(
-                err.to_string().contains("github channel must be selected"),
+                err.to_string().contains("git channel must be selected"),
                 "channel {ch}: got: {err}"
             );
         }

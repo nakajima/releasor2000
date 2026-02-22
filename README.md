@@ -2,7 +2,7 @@
 
 Release everywhere.
 
-A CLI tool that builds a Rust project for multiple targets and publishes releases across GitHub, Homebrew, Cargo, curl-installable scripts, and Nix flakes.
+A CLI tool that builds a Rust project for multiple targets and publishes releases across GitHub/Gitea, Homebrew, Cargo, curl-installable scripts, and Nix flakes.
 
 ## Install
 
@@ -57,7 +57,7 @@ releasor2000 release --version 0.1.0
 Or release to specific channels:
 
 ```sh
-releasor2000 release github homebrew
+releasor2000 release git homebrew
 ```
 
 Use `releasor2000 validate` to check your config without releasing.
@@ -83,7 +83,13 @@ targets = [
     "aarch64-unknown-linux-gnu",
 ]
 
-[channels.github]
+[git]
+# type = "gitea"                  # defaults to "github"
+# base_url = "https://git.example.com"
+# api_base_url = "https://git.example.com/api/v1"  # optional override
+# token_env = "GITEA_TOKEN"       # defaults: GITHUB_TOKEN or GITEA_TOKEN
+
+[channels.git]
 enabled = true
 
 # [channels.homebrew]
@@ -105,8 +111,17 @@ enabled = true
 |---|---|---|
 | `name` | yes | Project name |
 | `binary` | no | Binary name (defaults to `name`) |
-| `repo` | yes | GitHub repository (`owner/repo`) |
+| `repo` | yes | Repository path (`owner/repo`) |
 | `version_command` | no | Shell command to detect version (defaults to `git describe --tags --abbrev=0`) |
+
+### Git fields
+
+| Field | Required | Description |
+|---|---|---|
+| `type` | no | Git type: `github` (default) or `gitea` |
+| `base_url` | no | Web base URL (defaults to `https://github.com` for GitHub) |
+| `api_base_url` | no | API base URL override (Gitea defaults to `{base_url}/api/v1`) |
+| `token_env` | no | Token env var override (defaults to `GITHUB_TOKEN` or `GITEA_TOKEN`) |
 
 ### Build fields
 
@@ -121,22 +136,25 @@ enabled = true
 
 ## Channels
 
-The GitHub channel always runs first — it creates the release and uploads the build artifacts that the other channels (homebrew, curl, nix) depend on.
+The `git` channel always runs first — it creates the release on your git host and uploads the build artifacts that the other channels (homebrew, curl, nix) depend on.
 
-### GitHub
+### Release (`git` channel)
 
-Creates a GitHub release with auto-generated release notes and uploads `.tar.gz` archives for each target.
+Creates a release and uploads `.tar.gz` archives for each target.
 
 ```toml
-[channels.github]
+[channels.git]
 enabled = true
 ```
+
+On GitHub, release notes are auto-generated. On Gitea, a basic release is created.
 
 Archives are named `{binary}-{version}-{target}.tar.gz`.
 
 ### Homebrew
 
 Generates a Homebrew formula and pushes it to your tap repository. Only includes macOS targets.
+Download URLs in the formula are built from your git host `base_url`.
 
 ```toml
 [channels.homebrew]
@@ -157,17 +175,18 @@ Requires prior `cargo login`.
 
 ### Curl
 
-Generates an `install.sh` script that detects OS/arch and downloads the right binary from GitHub, then uploads it to the release.
+Generates an `install.sh` script that detects OS/arch and downloads the right binary from your configured git host, then uploads it to the release.
 
 ```toml
 [channels.curl]
 ```
 
-The generated script has the version baked in and is uploaded to the GitHub release as `install.sh`.
+The generated script has the version baked in and is uploaded to the release as `install.sh`.
 
 ### Nix
 
 Generates a `flake.nix` and `flake.lock` and pushes them to a repository.
+Source URLs are built from your git host `base_url`.
 
 ```toml
 [channels.nix]
@@ -182,7 +201,7 @@ When building for a target that differs from the host, releasor2000 automaticall
 
 ## Requirements
 
-- **`GITHUB_TOKEN`** — environment variable required for all channels that interact with GitHub (github, homebrew, curl, nix)
+- **Git token env var** — required for channels that interact with git APIs (`git`, `homebrew`, `curl`, `nix`); defaults are `GITHUB_TOKEN` (GitHub) and `GITEA_TOKEN` (Gitea), and you can override with `[git].token_env`
 - **rustup targets** — install targets with `rustup target add <target>`
 - **cargo-zigbuild** (optional) — for cross-compiling Linux targets from macOS
 - **nix** (optional) — required only for the nix channel

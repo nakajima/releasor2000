@@ -7,6 +7,10 @@ pub struct Config {
     pub project: Project,
     pub build: Build,
     #[serde(default)]
+    pub git: Git,
+    #[serde(default)]
+    pub forge: Option<toml::Value>,
+    #[serde(default)]
     pub channels: Channels,
 }
 
@@ -26,9 +30,35 @@ pub struct Build {
     pub targets: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GitType {
+    Github,
+    Gitea,
+}
+
+impl Default for GitType {
+    fn default() -> Self {
+        Self::Github
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct Git {
+    #[serde(default)]
+    pub r#type: GitType,
+    pub base_url: Option<String>,
+    pub api_base_url: Option<String>,
+    pub token_env: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct Channels {
-    pub github: Option<GitHubChannel>,
+    #[serde(default)]
+    pub github: Option<toml::Value>,
+    #[serde(default)]
+    pub forge: Option<toml::Value>,
+    pub git: Option<GitChannel>,
     pub homebrew: Option<HomebrewChannel>,
     pub cargo: Option<CargoChannel>,
     pub curl: Option<CurlChannel>,
@@ -36,7 +66,7 @@ pub struct Channels {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct GitHubChannel {
+pub struct GitChannel {
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -79,6 +109,44 @@ impl Project {
     }
 }
 
+impl Git {
+    fn normalized_url(url: Option<&str>, default: &str) -> String {
+        let selected = url
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default);
+        selected.trim_end_matches('/').to_string()
+    }
+
+    pub fn web_base_url(&self) -> String {
+        match self.r#type {
+            GitType::Github => Self::normalized_url(self.base_url.as_deref(), "https://github.com"),
+            GitType::Gitea => {
+                Self::normalized_url(self.base_url.as_deref(), "https://gitea.example.com")
+            }
+        }
+    }
+
+    pub fn api_base_url(&self) -> String {
+        match self.r#type {
+            GitType::Github => {
+                Self::normalized_url(self.api_base_url.as_deref(), "https://api.github.com")
+            }
+            GitType::Gitea => {
+                let default = format!("{}/api/v1", self.web_base_url());
+                Self::normalized_url(self.api_base_url.as_deref(), &default)
+            }
+        }
+    }
+
+    pub fn token_env(&self) -> &str {
+        self.token_env.as_deref().unwrap_or(match self.r#type {
+            GitType::Github => "GITHUB_TOKEN",
+            GitType::Gitea => "GITEA_TOKEN",
+        })
+    }
+}
+
 pub fn generate_template(project_name: &str) -> String {
     format!(
         r#"[project]
@@ -97,7 +165,13 @@ targets = [
     "aarch64-unknown-linux-gnu",
 ]
 
-[channels.github]
+[git]
+# type = "gitea"                  # defaults to "github"
+# base_url = "https://git.example.com"
+# api_base_url = "https://git.example.com/api/v1"  # defaults from type/base_url
+# token_env = "GITEA_TOKEN"       # defaults: GITHUB_TOKEN or GITEA_TOKEN
+
+[channels.git]
 enabled = true
 
 # [channels.homebrew]
@@ -129,6 +203,15 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.forge.is_some() {
+            bail!("forge section was removed; use git");
+        }
+        if self.channels.github.is_some() {
+            bail!("channels.github was removed; use channels.git");
+        }
+        if self.channels.forge.is_some() {
+            bail!("channels.forge was removed; use channels.git");
+        }
         if self.build.command.is_some() && self.build.pre_built_dir.is_some() {
             bail!("build.command and build.pre_built_dir are mutually exclusive");
         }
@@ -146,9 +229,9 @@ impl Config {
 
     pub fn enabled_channels(&self) -> Vec<&str> {
         let mut names = Vec::new();
-        if let Some(ch) = &self.channels.github {
+        if let Some(ch) = &self.channels.git {
             if ch.enabled {
-                names.push("github");
+                names.push("git");
             }
         }
         if let Some(ch) = &self.channels.homebrew {
@@ -206,6 +289,52 @@ targets = ["x86_64-apple-darwin"]
     }
 
     #[test]
+    fn git_defaults_to_github() {
+        let config = Config::parse(&minimal_toml()).unwrap();
+        assert_eq!(config.git.r#type, GitType::Github);
+        assert_eq!(config.git.web_base_url(), "https://github.com");
+        assert_eq!(config.git.api_base_url(), "https://api.github.com");
+        assert_eq!(config.git.token_env(), "GITHUB_TOKEN");
+    }
+
+    #[test]
+    fn git_gitea_defaults_from_base_url() {
+        let toml = format!(
+            "{}\n[git]\ntype = \"gitea\"\nbase_url = \"https://git.example.com\"\n",
+            minimal_toml()
+        );
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(config.git.r#type, GitType::Gitea);
+        assert_eq!(config.git.web_base_url(), "https://git.example.com");
+        assert_eq!(config.git.api_base_url(), "https://git.example.com/api/v1");
+        assert_eq!(config.git.token_env(), "GITEA_TOKEN");
+    }
+
+    #[test]
+    fn git_allows_custom_api_and_token() {
+        let toml = format!(
+            "{}\n[git]\ntype = \"gitea\"\nbase_url = \"https://git.example.com\"\napi_base_url = \"https://git.example.com/custom-api\"\ntoken_env = \"MY_TOKEN\"\n",
+            minimal_toml()
+        );
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(
+            config.git.api_base_url(),
+            "https://git.example.com/custom-api"
+        );
+        assert_eq!(config.git.token_env(), "MY_TOKEN");
+    }
+
+    #[test]
+    fn git_blank_api_base_url_uses_default() {
+        let toml = format!(
+            "{}\n[git]\ntype = \"gitea\"\nbase_url = \"https://git.example.com\"\napi_base_url = \"   \"\n",
+            minimal_toml()
+        );
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(config.git.api_base_url(), "https://git.example.com/api/v1");
+    }
+
+    #[test]
     fn binary_defaults_to_name() {
         let config = Config::parse(&minimal_toml()).unwrap();
         assert_eq!(config.project.binary(), "myapp");
@@ -258,10 +387,7 @@ pre_built_dir = "dist/"
 targets = ["x86_64-apple-darwin"]
 "#;
         let err = Config::parse(toml).unwrap_err();
-        assert!(
-            err.to_string().contains("mutually exclusive"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
     }
 
     #[test]
@@ -332,13 +458,73 @@ command = "make"
 artifact = "out/bin"
 targets = ["x86_64-apple-darwin"]
 
-[channels.github]
+[channels.git]
 
 [channels.homebrew]
 tap = "owner/homebrew-tap"
 "#;
         let config = Config::parse(toml).unwrap();
-        assert_eq!(config.enabled_channels(), vec!["github", "homebrew"]);
+        assert_eq!(config.enabled_channels(), vec!["git", "homebrew"]);
+    }
+
+    #[test]
+    fn github_channel_is_rejected() {
+        let toml = r#"
+[project]
+name = "myapp"
+repo = "owner/repo"
+
+[build]
+command = "make"
+artifact = "out/bin"
+targets = ["x86_64-apple-darwin"]
+
+[channels.github]
+enabled = true
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("channels.github was removed; use channels.git"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn forge_channel_is_rejected() {
+        let toml = r#"
+[project]
+name = "myapp"
+repo = "owner/repo"
+
+[build]
+command = "make"
+artifact = "out/bin"
+targets = ["x86_64-apple-darwin"]
+
+[channels.forge]
+enabled = true
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("channels.forge was removed; use channels.git"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn forge_section_is_rejected() {
+        let toml = format!(
+            "{}\n[forge]\ntype = \"gitea\"\nbase_url = \"https://git.example.com\"\n",
+            minimal_toml()
+        );
+        let err = Config::parse(&toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("forge section was removed; use git"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -394,7 +580,7 @@ targets = [
     "aarch64-unknown-linux-gnu",
 ]
 
-[channels.github]
+[channels.git]
 enabled = true
 
 [channels.homebrew]
@@ -416,10 +602,16 @@ flake_repo = "owner/nix-repo"
         assert_eq!(config.build.targets.len(), 4);
         assert_eq!(
             config.enabled_channels(),
-            vec!["github", "homebrew", "curl", "nix"]
+            vec!["git", "homebrew", "curl", "nix"]
         );
         assert_eq!(
-            config.channels.homebrew.as_ref().unwrap().formula_name.as_deref(),
+            config
+                .channels
+                .homebrew
+                .as_ref()
+                .unwrap()
+                .formula_name
+                .as_deref(),
             Some("myapp")
         );
     }
