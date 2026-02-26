@@ -197,11 +197,19 @@ Requires the `nix` command to be available.
 
 ## Cross-compilation
 
-When building for a target that differs from the host, releasor2000 automatically detects `cargo-zigbuild` and uses it in place of `cargo build`. macOS targets can cross-compile between x86_64 and aarch64 natively without extra tooling.
+When building for a target that differs from the host, releasor2000 prefers:
+
+- `cargo-zigbuild` (if installed)
+- `cross` (if installed, as fallback)
+
+If neither is installed, it falls back to plain `cargo build` (which may still work if you configured `CARGO_TARGET_<TRIPLE>_LINKER`).
+
+macOS targets can cross-compile between x86_64 and aarch64 natively on macOS. Building macOS targets from non-macOS hosts usually requires Apple SDK tooling, so use a macOS builder for those targets.
 
 ## Requirements
 
 - **Git token env var** — required for channels that interact with git APIs (`git`, `homebrew`, `curl`, `nix`); defaults are `GITHUB_TOKEN` (GitHub) and `GITEA_TOKEN` (Gitea), and you can override with `[git].token_env`
 - **rustup targets** — install targets with `rustup target add <target>`
-- **cargo-zigbuild** (optional) — for cross-compiling Linux targets from macOS
+- **cargo-zigbuild** (optional) — preferred cross-compilation backend
+- **cross** (optional) — fallback cross-compilation backend
 - **nix** (optional) — required only for the nix channel

@@ -223,6 +223,62 @@ fn has_cargo_zigbuild() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+fn has_cross() -> bool {
+    Command::new("cross")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+fn linker_env_var(target: &str) -> String {
+    format!(
+        "CARGO_TARGET_{}_LINKER",
+        target.to_ascii_uppercase().replace('-', "_")
+    )
+}
+
+enum CargoBuildPlan {
+    RunAsIs,
+    ReplaceCommand {
+        replacement: &'static str,
+        tool_name: &'static str,
+    },
+    Skip(&'static str),
+}
+
+fn plan_cargo_build(
+    host: &str,
+    target: &str,
+    zigbuild_available: bool,
+    cross_available: bool,
+) -> CargoBuildPlan {
+    if !needs_cross_linker(host, target) {
+        return CargoBuildPlan::RunAsIs;
+    }
+
+    if !host.contains("darwin") && target.contains("apple-darwin") {
+        return CargoBuildPlan::Skip(
+            "macOS targets require Apple SDK/toolchains; build these on a macOS runner",
+        );
+    }
+
+    if zigbuild_available && !target.contains("apple-darwin") {
+        return CargoBuildPlan::ReplaceCommand {
+            replacement: "cargo zigbuild",
+            tool_name: "cargo-zigbuild",
+        };
+    }
+
+    if cross_available && !target.contains("apple-darwin") {
+        return CargoBuildPlan::ReplaceCommand {
+            replacement: "cross build",
+            tool_name: "cross",
+        };
+    }
+
+    CargoBuildPlan::RunAsIs
+}
+
 fn parse_installed_targets(output: &str) -> HashSet<String> {
     output
         .lines()
@@ -248,6 +304,7 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
 
     let host = host_target().unwrap_or_default();
     let zigbuild_available = has_cargo_zigbuild();
+    let cross_available = has_cross();
 
     let mut archives = Vec::new();
     let mut failed = Vec::new();
@@ -259,16 +316,36 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
         ];
 
         let artifact_path = if let Some(cmd_template) = &config.build.command {
-            let cmd_str = substitute(cmd_template, vars);
-            let cmd_str = if cmd_str.contains("cargo build")
-                && zigbuild_available
-                && needs_cross_linker(&host, target)
-            {
-                eprintln!("[build] Using cargo-zigbuild for cross-compilation target {target}");
-                cmd_str.replace("cargo build", "cargo zigbuild")
-            } else {
-                cmd_str
-            };
+            let mut cmd_str = substitute(cmd_template, vars);
+            let cross_needed = needs_cross_linker(&host, target);
+
+            if cmd_str.contains("cargo build") {
+                match plan_cargo_build(&host, target, zigbuild_available, cross_available) {
+                    CargoBuildPlan::RunAsIs => {
+                        if cross_needed {
+                            eprintln!(
+                                "[build] No cross helper detected for {target}; trying plain cargo build (set {} if linker errors occur)",
+                                linker_env_var(target)
+                            );
+                        }
+                    }
+                    CargoBuildPlan::ReplaceCommand {
+                        replacement,
+                        tool_name,
+                    } => {
+                        eprintln!(
+                            "[build] Using {tool_name} for cross-compilation target {target}"
+                        );
+                        cmd_str = cmd_str.replacen("cargo build", replacement, 1);
+                    }
+                    CargoBuildPlan::Skip(reason) => {
+                        eprintln!("[build] Warning: target {target} skipped: {reason}");
+                        failed.push(target.clone());
+                        continue;
+                    }
+                }
+            }
+
             let parts: Vec<&str> = cmd_str.split_whitespace().collect();
             let (bin, args) = parts
                 .split_first()
@@ -359,13 +436,25 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
                 }
             }
             if !installed_failed.is_empty() {
-                eprintln!("\nInstalled but failed to build (missing cross-compilation linker):");
+                eprintln!(
+                    "\nInstalled but failed to build (missing cross-compilation linker/SDK):"
+                );
                 for t in &installed_failed {
                     eprintln!("  - {t}");
                 }
                 eprintln!(
                     "  Tip: install `cross` (uses Docker) or `cargo-zigbuild` (uses zig) for cross-compilation"
                 );
+                eprintln!("  Or configure a target linker, for example:");
+                for t in installed_failed.iter().take(3) {
+                    eprintln!("    export {}=<path-to-linker>", linker_env_var(t));
+                }
+                if installed_failed.len() > 3 {
+                    eprintln!("    ...");
+                }
+                if installed_failed.iter().any(|t| t.contains("apple-darwin")) {
+                    eprintln!("  Note: Apple targets usually require building on macOS.");
+                }
             }
         }
         if config.build.pre_built_dir.is_some() {
@@ -603,16 +692,7 @@ fn release_homebrew(
         format!("[homebrew] release v{version} not found — run the git channel first")
     })?;
 
-    let mut darwin_arm_sha = String::new();
-    let mut darwin_intel_sha = String::new();
-
-    for (target, path) in archives {
-        if target.contains("aarch64") && target.contains("apple-darwin") {
-            darwin_arm_sha = sha256(path)?;
-        } else if target.contains("x86_64") && target.contains("apple-darwin") {
-            darwin_intel_sha = sha256(path)?;
-        }
-    }
+    let (darwin_arm_sha, darwin_intel_sha) = homebrew_macos_shas(archives)?;
 
     let formula = generate_formula(
         formula_name,
@@ -643,6 +723,32 @@ fn release_homebrew(
     git_api(git, "homebrew", "PUT", &api_url, Some(&body.to_string()))?;
     println!("[homebrew] Updated formula {formula_name} in {}", ch.tap);
     Ok(())
+}
+
+fn homebrew_macos_shas(archives: &[(String, PathBuf)]) -> Result<(String, String)> {
+    let mut darwin_arm: Option<&PathBuf> = None;
+    let mut darwin_intel: Option<&PathBuf> = None;
+
+    for (target, path) in archives {
+        if target == "aarch64-apple-darwin" {
+            darwin_arm = Some(path);
+        } else if target == "x86_64-apple-darwin" {
+            darwin_intel = Some(path);
+        }
+    }
+
+    let darwin_arm = darwin_arm.ok_or_else(|| {
+        anyhow::anyhow!(
+            "[homebrew] missing artifact for target aarch64-apple-darwin; build it or disable channels.homebrew"
+        )
+    })?;
+    let darwin_intel = darwin_intel.ok_or_else(|| {
+        anyhow::anyhow!(
+            "[homebrew] missing artifact for target x86_64-apple-darwin; build it or disable channels.homebrew"
+        )
+    })?;
+
+    Ok((sha256(darwin_arm)?, sha256(darwin_intel)?))
 }
 
 fn generate_formula(
@@ -1083,6 +1189,25 @@ mod tests {
         assert!(formula.contains("https://git.example.com/owner/repo/releases/download"));
     }
 
+    // --- homebrew archive validation tests ---
+
+    #[test]
+    fn homebrew_macos_shas_requires_arm_archive() {
+        let archives = vec![(
+            "x86_64-unknown-linux-gnu".to_string(),
+            PathBuf::from("unused"),
+        )];
+        let err = homebrew_macos_shas(&archives).unwrap_err();
+        assert!(err.to_string().contains("aarch64-apple-darwin"));
+    }
+
+    #[test]
+    fn homebrew_macos_shas_requires_intel_archive() {
+        let archives = vec![("aarch64-apple-darwin".to_string(), PathBuf::from("unused"))];
+        let err = homebrew_macos_shas(&archives).unwrap_err();
+        assert!(err.to_string().contains("x86_64-apple-darwin"));
+    }
+
     // --- parse_host_target tests ---
 
     #[test]
@@ -1131,6 +1256,72 @@ mod tests {
             "x86_64-unknown-linux-gnu",
             "aarch64-unknown-linux-gnu"
         ));
+    }
+
+    // --- cross build planning tests ---
+
+    #[test]
+    fn linker_env_var_formats_target() {
+        assert_eq!(
+            linker_env_var("aarch64-unknown-linux-gnu"),
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"
+        );
+    }
+
+    #[test]
+    fn plan_cargo_build_uses_zigbuild_for_linux_cross_target() {
+        let plan = plan_cargo_build(
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            true,
+            false,
+        );
+        assert!(matches!(
+            plan,
+            CargoBuildPlan::ReplaceCommand {
+                replacement: "cargo zigbuild",
+                tool_name: "cargo-zigbuild"
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_cargo_build_falls_back_to_cross() {
+        let plan = plan_cargo_build(
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            false,
+            true,
+        );
+        assert!(matches!(
+            plan,
+            CargoBuildPlan::ReplaceCommand {
+                replacement: "cross build",
+                tool_name: "cross"
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_cargo_build_skips_darwin_on_non_darwin_hosts() {
+        let plan = plan_cargo_build(
+            "x86_64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            true,
+            true,
+        );
+        assert!(matches!(plan, CargoBuildPlan::Skip(_)));
+    }
+
+    #[test]
+    fn plan_cargo_build_runs_as_is_for_native_target() {
+        let plan = plan_cargo_build(
+            "x86_64-unknown-linux-gnu",
+            "x86_64-unknown-linux-gnu",
+            true,
+            true,
+        );
+        assert!(matches!(plan, CargoBuildPlan::RunAsIs));
     }
 
     // --- parse_installed_targets tests ---
