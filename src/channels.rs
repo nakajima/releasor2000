@@ -241,8 +241,16 @@ fn installed_targets() -> HashSet<String> {
         .unwrap_or_default()
 }
 
-fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBuf)>> {
-    let binary = config.project.binary();
+#[derive(Debug, Clone)]
+struct BuiltArchive {
+    binary: String,
+    target: String,
+    asset_name: String,
+    archive_path: PathBuf,
+}
+
+fn build_artifacts(config: &Config, version: &str) -> Result<Vec<BuiltArchive>> {
+    let binaries = config.project.release_binaries();
     let staging = PathBuf::from("target/release-staging");
     std::fs::create_dir_all(&staging)?;
 
@@ -250,97 +258,106 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
     let zigbuild_available = has_cargo_zigbuild();
 
     let mut archives = Vec::new();
-    let mut failed = Vec::new();
-    for target in &config.build.targets {
-        let vars = &[
-            ("target", target.as_str()),
-            ("binary", binary),
-            ("version", version),
-        ];
+    let mut failed_pairs: Vec<(String, String)> = Vec::new();
+    let total_attempts = config.build.targets.len() * binaries.len();
 
-        let artifact_path = if let Some(cmd_template) = &config.build.command {
-            let cmd_str = substitute(cmd_template, vars);
-            let cmd_str = if cmd_str.contains("cargo build")
-                && zigbuild_available
-                && needs_cross_linker(&host, target)
-            {
-                eprintln!("[build] Using cargo-zigbuild for cross-compilation target {target}");
-                cmd_str.replace("cargo build", "cargo zigbuild")
+    for target in &config.build.targets {
+        for binary in &binaries {
+            let vars = &[
+                ("target", target.as_str()),
+                ("binary", *binary),
+                ("version", version),
+            ];
+
+            let artifact_path = if let Some(cmd_template) = &config.build.command {
+                let cmd_str = substitute(cmd_template, vars);
+                let cmd_str = if cmd_str.contains("cargo build")
+                    && zigbuild_available
+                    && needs_cross_linker(&host, target)
+                {
+                    eprintln!("[build] Using cargo-zigbuild for cross-compilation target {target}");
+                    cmd_str.replace("cargo build", "cargo zigbuild")
+                } else {
+                    cmd_str
+                };
+                let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+                let (bin, args) = parts
+                    .split_first()
+                    .ok_or_else(|| anyhow::anyhow!("empty build command"))?;
+                if let Err(e) = run_cmd("build", None, bin, args) {
+                    eprintln!("[build] Warning: {binary} ({target}) failed: {e}");
+                    failed_pairs.push(((*binary).to_string(), target.clone()));
+                    continue;
+                }
+
+                let artifact_template = config
+                    .build
+                    .artifact
+                    .as_ref()
+                    .expect("artifact required with command");
+                PathBuf::from(substitute(artifact_template, vars))
             } else {
-                cmd_str
+                let dir = config
+                    .build
+                    .pre_built_dir
+                    .as_ref()
+                    .expect("pre_built_dir required");
+                PathBuf::from(substitute(dir, vars)).join(format!("{binary}-{target}"))
             };
-            let parts: Vec<&str> = cmd_str.split_whitespace().collect();
-            let (bin, args) = parts
-                .split_first()
-                .ok_or_else(|| anyhow::anyhow!("empty build command"))?;
-            if let Err(e) = run_cmd("build", None, bin, args) {
-                eprintln!("[build] Warning: target {target} failed: {e}");
-                failed.push(target.clone());
+
+            if !artifact_path.exists() {
+                eprintln!(
+                    "[build] Warning: {binary} ({target}) failed: artifact not found at {}",
+                    artifact_path.display()
+                );
+                failed_pairs.push(((*binary).to_string(), target.clone()));
                 continue;
             }
 
-            let artifact_template = config
-                .build
-                .artifact
-                .as_ref()
-                .expect("artifact required with command");
-            PathBuf::from(substitute(artifact_template, vars))
-        } else {
-            let dir = config
-                .build
-                .pre_built_dir
-                .as_ref()
-                .expect("pre_built_dir required");
-            PathBuf::from(substitute(dir, vars)).join(format!("{binary}-{target}"))
-        };
+            let archive_name = format!("{binary}-{version}-{target}.tar.gz");
+            let archive_path = staging.join(&archive_name);
 
-        if !artifact_path.exists() {
-            eprintln!(
-                "[build] Warning: target {target} failed: artifact not found at {}",
-                artifact_path.display()
-            );
-            failed.push(target.clone());
-            continue;
+            let artifact_dir = artifact_path.parent().unwrap_or_else(|| Path::new("."));
+            let artifact_file = artifact_path
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("artifact has no filename"))?
+                .to_string_lossy();
+
+            run_cmd(
+                "build",
+                Some(artifact_dir),
+                "tar",
+                &[
+                    "czf",
+                    &archive_path
+                        .canonicalize()
+                        .unwrap_or(std::fs::canonicalize(&staging)?.join(&archive_name))
+                        .to_string_lossy(),
+                    &artifact_file,
+                ],
+            )?;
+
+            archives.push(BuiltArchive {
+                binary: (*binary).to_string(),
+                target: target.clone(),
+                asset_name: archive_name,
+                archive_path,
+            });
         }
-
-        let archive_name = format!("{binary}-{version}-{target}.tar.gz");
-        let archive_path = staging.join(&archive_name);
-
-        let artifact_dir = artifact_path.parent().unwrap_or_else(|| Path::new("."));
-        let artifact_file = artifact_path
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("artifact has no filename"))?
-            .to_string_lossy();
-
-        run_cmd(
-            "build",
-            Some(artifact_dir),
-            "tar",
-            &[
-                "czf",
-                &archive_path
-                    .canonicalize()
-                    .unwrap_or(std::fs::canonicalize(&staging)?.join(&archive_name))
-                    .to_string_lossy(),
-                &artifact_file,
-            ],
-        )?;
-
-        archives.push((target.clone(), archive_path));
     }
 
     if archives.is_empty() {
-        bail!("all build targets failed");
+        bail!("all build target/binary combinations failed");
     }
 
-    if !failed.is_empty() {
+    if !failed_pairs.is_empty() {
         eprintln!(
-            "\n{}/{} targets failed:",
-            failed.len(),
-            config.build.targets.len()
+            "\n{}/{} target/binary combinations failed:",
+            failed_pairs.len(),
+            total_attempts
         );
-        for t in &failed {
-            eprintln!("  - {t}");
+        for (binary, target) in &failed_pairs {
+            eprintln!("  - {binary} ({target})");
         }
         if config
             .build
@@ -349,19 +366,26 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
             .is_some_and(|c| c.contains("cargo"))
         {
             let installed = installed_targets();
-            let (installed_failed, missing): (Vec<_>, Vec<_>) =
-                failed.iter().partition(|t| installed.contains(t.as_str()));
+            let mut failed_targets = Vec::new();
+            for (_, target) in &failed_pairs {
+                if !failed_targets.contains(target) {
+                    failed_targets.push(target.clone());
+                }
+            }
+            let (installed_failed, missing): (Vec<_>, Vec<_>) = failed_targets
+                .into_iter()
+                .partition(|target| installed.contains(target.as_str()));
 
             if !missing.is_empty() {
                 eprintln!("\nMissing targets (install with rustup):");
-                for t in &missing {
-                    eprintln!("  rustup target add {t}");
+                for target in &missing {
+                    eprintln!("  rustup target add {target}");
                 }
             }
             if !installed_failed.is_empty() {
                 eprintln!("\nInstalled but failed to build (missing cross-compilation linker):");
-                for t in &installed_failed {
-                    eprintln!("  - {t}");
+                for target in &installed_failed {
+                    eprintln!("  - {target}");
                 }
                 eprintln!(
                     "  Tip: install `cross` (uses Docker) or `cargo-zigbuild` (uses zig) for cross-compilation"
@@ -371,12 +395,15 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
         if config.build.pre_built_dir.is_some() {
             let dir = config.build.pre_built_dir.as_ref().unwrap();
             eprintln!("\nExpected pre-built artifacts in {dir}:");
-            for t in &failed {
-                eprintln!("  {dir}{binary}-{t}");
+            for (binary, target) in &failed_pairs {
+                eprintln!("  {dir}{binary}-{target}");
             }
         }
         eprintln!();
-        let succeeded: Vec<&str> = archives.iter().map(|(t, _)| t.as_str()).collect();
+        let succeeded: Vec<String> = archives
+            .iter()
+            .map(|archive| format!("{} ({})", archive.binary, archive.target))
+            .collect();
         eprintln!("Succeeded: {}", succeeded.join(", "));
         if !confirm("Continue with successful targets?")? {
             bail!("aborted by user");
@@ -504,6 +531,19 @@ pub fn release(
         config.project.name,
         selected.join(", ")
     );
+    let release_binaries = config.project.release_binaries();
+    if release_binaries.len() > 1 {
+        println!("Release binaries: {}", release_binaries.join(", "));
+        if selected
+            .iter()
+            .any(|ch| matches!(*ch, "homebrew" | "curl" | "nix"))
+        {
+            println!(
+                "Note: homebrew/curl/nix use primary binary '{}'; all binaries are uploaded as git release assets.",
+                config.project.primary_binary()
+            );
+        }
+    }
 
     let archives = build_artifacts(config, &version)?;
 
@@ -576,12 +616,18 @@ fn release_git(
     config: &Config,
     git: &GitContext,
     version: &str,
-    archives: &[(String, PathBuf)],
+    archives: &[BuiltArchive],
 ) -> Result<()> {
     let upload_url = create_release(git, &config.project.repo, version)?;
-    for (_, path) in archives {
-        let name = path.file_name().unwrap().to_string_lossy();
-        git_upload_asset(git, "git", &upload_url, path, &name, "application/gzip")?;
+    for archive in archives {
+        git_upload_asset(
+            git,
+            "git",
+            &upload_url,
+            &archive.archive_path,
+            &archive.asset_name,
+            "application/gzip",
+        )?;
     }
     println!("[git] Created release v{version}");
     Ok(())
@@ -591,11 +637,11 @@ fn release_homebrew(
     config: &Config,
     git: &GitContext,
     version: &str,
-    archives: &[(String, PathBuf)],
+    archives: &[BuiltArchive],
 ) -> Result<()> {
     let ch = config.channels.homebrew.as_ref().unwrap();
     let formula_name = ch.formula_name.as_deref().unwrap_or(&config.project.name);
-    let binary = config.project.binary();
+    let binary = config.project.primary_binary();
     let repo = &config.project.repo;
 
     let release_url = git.repo_api_url(repo, &format!("/releases/tags/v{version}"));
@@ -606,11 +652,14 @@ fn release_homebrew(
     let mut darwin_arm_sha = String::new();
     let mut darwin_intel_sha = String::new();
 
-    for (target, path) in archives {
-        if target.contains("aarch64") && target.contains("apple-darwin") {
-            darwin_arm_sha = sha256(path)?;
-        } else if target.contains("x86_64") && target.contains("apple-darwin") {
-            darwin_intel_sha = sha256(path)?;
+    for archive in archives {
+        if archive.binary != binary {
+            continue;
+        }
+        if archive.target.contains("aarch64") && archive.target.contains("apple-darwin") {
+            darwin_arm_sha = sha256(&archive.archive_path)?;
+        } else if archive.target.contains("x86_64") && archive.target.contains("apple-darwin") {
+            darwin_intel_sha = sha256(&archive.archive_path)?;
         }
     }
 
@@ -689,7 +738,7 @@ fn release_cargo(config: &Config) -> Result<()> {
 }
 
 fn release_curl(config: &Config, git: &GitContext, version: &str) -> Result<()> {
-    let binary = config.project.binary();
+    let binary = config.project.primary_binary();
     let repo = &config.project.repo;
 
     let script = generate_install_script(binary, repo, version, &git.web_base_url);
@@ -835,10 +884,10 @@ fn release_nix(
     config: &Config,
     git: &GitContext,
     version: &str,
-    archives: &[(String, PathBuf)],
+    archives: &[BuiltArchive],
 ) -> Result<()> {
     let ch = config.channels.nix.as_ref().unwrap();
-    let binary = config.project.binary();
+    let binary = config.project.primary_binary();
     let repo = &config.project.repo;
     let flake_repo = ch.flake_repo.as_deref().unwrap_or(repo);
 
@@ -852,19 +901,24 @@ fn release_nix(
     std::fs::create_dir_all(&staging)?;
 
     let mut system_hashes = Vec::new();
-    for (target, _) in archives {
+    for archive in archives {
+        if archive.binary != binary {
+            continue;
+        }
+
+        let target = &archive.target;
         let nix_sys = match nix_system(target) {
             Some(s) => s,
             None => continue,
         };
-        let asset_name = format!("{binary}-{version}-{target}.tar.gz");
-        let download_url = git.release_download_url(repo, version, &asset_name);
+        let asset_name = archive.asset_name.as_str();
+        let download_url = git.release_download_url(repo, version, asset_name);
 
         // Verify asset exists in the release
         let assets = release["assets"].as_array();
         let asset_exists = assets.is_some_and(|a| {
             a.iter()
-                .any(|asset| asset["name"].as_str() == Some(&asset_name))
+                .any(|asset| asset["name"].as_str() == Some(asset_name))
         });
         if !asset_exists {
             eprintln!("[nix] Warning: asset {asset_name} not found in release, skipping");

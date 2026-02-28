@@ -70,6 +70,7 @@ Use `releasor2000 validate` to check your config without releasing.
 [project]
 name = "myapp"
 # binary = "myapp"  # defaults to project name
+# binaries = ["myapp", "myapp-cli"]  # optional extra release assets
 repo = "owner/myapp"
 # version_command = "git describe --tags --abbrev=0"
 
@@ -110,9 +111,12 @@ enabled = true
 | Field | Required | Description |
 |---|---|---|
 | `name` | yes | Project name |
-| `binary` | no | Binary name (defaults to `name`) |
+| `binary` | no | Primary binary for single-binary channels (defaults to `name`) |
+| `binaries` | no | Additional binaries to package/upload as release assets |
 | `repo` | yes | Repository path (`owner/repo`) |
 | `version_command` | no | Shell command to detect version (defaults to `git describe --tags --abbrev=0`) |
+
+If `binaries` is set, releasor2000 builds/packages each `{binary}` per target and uploads each archive as its own release asset. If both `binary` and `binaries` are set, `binary` must be included in `binaries`.
 
 ### Git fields
 
@@ -140,7 +144,7 @@ The `git` channel always runs first — it creates the release on your git host 
 
 ### Release (`git` channel)
 
-Creates a release and uploads `.tar.gz` archives for each target.
+Creates a release and uploads `.tar.gz` archives for each binary/target combination.
 
 ```toml
 [channels.git]
@@ -155,6 +159,7 @@ Archives are named `{binary}-{version}-{target}.tar.gz`.
 
 Generates a Homebrew formula and pushes it to your tap repository. Only includes macOS targets.
 Download URLs in the formula are built from your git host `base_url`.
+Uses the primary binary (`project.binary`, or the first item in `project.binaries`).
 
 ```toml
 [channels.homebrew]
@@ -176,6 +181,7 @@ Requires prior `cargo login`.
 ### Curl
 
 Generates an `install.sh` script that detects OS/arch and downloads the right binary from your configured git host, then uploads it to the release.
+Uses the primary binary (`project.binary`, or the first item in `project.binaries`).
 
 ```toml
 [channels.curl]
@@ -187,6 +193,7 @@ The generated script has the version baked in and is uploaded to the release as 
 
 Generates a `flake.nix` and `flake.lock` and pushes them to a repository.
 Source URLs are built from your git host `base_url`.
+Uses the primary binary (`project.binary`, or the first item in `project.binaries`).
 
 ```toml
 [channels.nix]

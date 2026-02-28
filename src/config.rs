@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
@@ -18,6 +19,7 @@ pub struct Config {
 pub struct Project {
     pub name: String,
     pub binary: Option<String>,
+    pub binaries: Option<Vec<String>>,
     pub repo: String,
     pub version_command: Option<String>,
 }
@@ -104,8 +106,26 @@ fn default_true() -> bool {
 }
 
 impl Project {
+    pub fn primary_binary(&self) -> &str {
+        if let Some(binary) = self.binary.as_deref() {
+            binary
+        } else if let Some(binaries) = &self.binaries {
+            binaries.first().map(String::as_str).unwrap_or(&self.name)
+        } else {
+            &self.name
+        }
+    }
+
     pub fn binary(&self) -> &str {
-        self.binary.as_deref().unwrap_or(&self.name)
+        self.primary_binary()
+    }
+
+    pub fn release_binaries(&self) -> Vec<&str> {
+        if let Some(binaries) = &self.binaries {
+            binaries.iter().map(String::as_str).collect()
+        } else {
+            vec![self.primary_binary()]
+        }
     }
 }
 
@@ -152,6 +172,7 @@ pub fn generate_template(project_name: &str) -> String {
         r#"[project]
 name = "{project_name}"
 # binary = "{project_name}"  # defaults to project name
+# binaries = ["{project_name}", "{project_name}-cli"]  # optional extra release assets
 repo = "owner/{project_name}"
 # version_command = "git describe --tags --abbrev=0"
 
@@ -211,6 +232,30 @@ impl Config {
         }
         if self.channels.forge.is_some() {
             bail!("channels.forge was removed; use channels.git");
+        }
+        if let Some(binary) = self.project.binary.as_deref() {
+            if binary.trim().is_empty() {
+                bail!("project.binary must not be empty");
+            }
+        }
+        if let Some(binaries) = &self.project.binaries {
+            if binaries.is_empty() {
+                bail!("project.binaries must not be empty");
+            }
+            let mut seen: HashSet<&str> = HashSet::new();
+            for binary in binaries {
+                if binary.trim().is_empty() {
+                    bail!("project.binaries must not contain empty values");
+                }
+                if !seen.insert(binary.as_str()) {
+                    bail!("project.binaries must not contain duplicate values");
+                }
+            }
+            if let Some(binary) = self.project.binary.as_deref() {
+                if !binaries.iter().any(|b| b == binary) {
+                    bail!("project.binary must be included in project.binaries when both are set");
+                }
+            }
         }
         if self.build.command.is_some() && self.build.pre_built_dir.is_some() {
             bail!("build.command and build.pre_built_dir are mutually exclusive");
@@ -283,6 +328,7 @@ targets = ["x86_64-apple-darwin"]
         assert_eq!(config.project.repo, "owner/repo");
         assert_eq!(config.project.binary(), "myapp");
         assert!(config.project.binary.is_none());
+        assert!(config.project.binaries.is_none());
         assert!(config.project.version_command.is_none());
         assert_eq!(config.build.targets.len(), 1);
         assert!(config.enabled_channels().is_empty());
@@ -338,6 +384,7 @@ targets = ["x86_64-apple-darwin"]
     fn binary_defaults_to_name() {
         let config = Config::parse(&minimal_toml()).unwrap();
         assert_eq!(config.project.binary(), "myapp");
+        assert_eq!(config.project.release_binaries(), vec!["myapp"]);
     }
 
     #[test]
@@ -355,6 +402,114 @@ targets = ["x86_64-apple-darwin"]
 "#;
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.project.binary(), "myapp-bin");
+        assert_eq!(config.project.release_binaries(), vec!["myapp-bin"]);
+    }
+
+    #[test]
+    fn binaries_override_defaults_when_binary_is_unset() {
+        let toml = r#"
+[project]
+name = "myapp"
+binaries = ["myapp-server", "myapp-cli"]
+repo = "owner/repo"
+
+[build]
+command = "make"
+artifact = "out/{binary}"
+targets = ["x86_64-apple-darwin"]
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.project.primary_binary(), "myapp-server");
+        assert_eq!(
+            config.project.release_binaries(),
+            vec!["myapp-server", "myapp-cli"]
+        );
+    }
+
+    #[test]
+    fn binaries_and_binary_can_be_set_together() {
+        let toml = r#"
+[project]
+name = "myapp"
+binary = "myapp-cli"
+binaries = ["myapp-server", "myapp-cli"]
+repo = "owner/repo"
+
+[build]
+command = "make"
+artifact = "out/{binary}"
+targets = ["x86_64-apple-darwin"]
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.project.primary_binary(), "myapp-cli");
+        assert_eq!(
+            config.project.release_binaries(),
+            vec!["myapp-server", "myapp-cli"]
+        );
+    }
+
+    #[test]
+    fn binaries_reject_empty_list() {
+        let toml = r#"
+[project]
+name = "myapp"
+binaries = []
+repo = "owner/repo"
+
+[build]
+command = "make"
+artifact = "out/{binary}"
+targets = ["x86_64-apple-darwin"]
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("project.binaries must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn binaries_reject_duplicates() {
+        let toml = r#"
+[project]
+name = "myapp"
+binaries = ["myapp", "myapp"]
+repo = "owner/repo"
+
+[build]
+command = "make"
+artifact = "out/{binary}"
+targets = ["x86_64-apple-darwin"]
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("project.binaries must not contain duplicate values"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn binary_must_exist_in_binaries_when_both_are_set() {
+        let toml = r#"
+[project]
+name = "myapp"
+binary = "myapp-cli"
+binaries = ["myapp-server"]
+repo = "owner/repo"
+
+[build]
+command = "make"
+artifact = "out/{binary}"
+targets = ["x86_64-apple-darwin"]
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("project.binary must be included in project.binaries"),
+            "got: {err}"
+        );
     }
 
     #[test]
