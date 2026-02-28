@@ -46,6 +46,9 @@ $EDITOR releasor2000.toml
 # Tag a version and release
 git tag v0.1.0
 releasor2000 release
+
+# Upgrade releasor2000 itself in place
+releasor2000 upgrade
 ```
 
 You can also pass `--version` directly:

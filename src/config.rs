@@ -116,10 +116,6 @@ impl Project {
         }
     }
 
-    pub fn binary(&self) -> &str {
-        self.primary_binary()
-    }
-
     pub fn release_binaries(&self) -> Vec<&str> {
         if let Some(binaries) = &self.binaries {
             binaries.iter().map(String::as_str).collect()
@@ -326,7 +322,7 @@ targets = ["x86_64-apple-darwin"]
         let config = Config::parse(&minimal_toml()).unwrap();
         assert_eq!(config.project.name, "myapp");
         assert_eq!(config.project.repo, "owner/repo");
-        assert_eq!(config.project.binary(), "myapp");
+        assert_eq!(config.project.primary_binary(), "myapp");
         assert!(config.project.binary.is_none());
         assert!(config.project.binaries.is_none());
         assert!(config.project.version_command.is_none());
@@ -383,7 +379,7 @@ targets = ["x86_64-apple-darwin"]
     #[test]
     fn binary_defaults_to_name() {
         let config = Config::parse(&minimal_toml()).unwrap();
-        assert_eq!(config.project.binary(), "myapp");
+        assert_eq!(config.project.primary_binary(), "myapp");
         assert_eq!(config.project.release_binaries(), vec!["myapp"]);
     }
 
@@ -401,7 +397,7 @@ artifact = "out/{binary}"
 targets = ["x86_64-apple-darwin"]
 "#;
         let config = Config::parse(toml).unwrap();
-        assert_eq!(config.project.binary(), "myapp-bin");
+        assert_eq!(config.project.primary_binary(), "myapp-bin");
         assert_eq!(config.project.release_binaries(), vec!["myapp-bin"]);
     }
 

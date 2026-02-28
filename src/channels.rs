@@ -800,9 +800,13 @@ echo "Downloading $BINARY v$VERSION for $TARGET..."
 curl -fsSL "$URL" | tar xz -C "$TMPDIR"
 
 if [ -z "${{INSTALL_DIR:-}}" ]; then
-  printf "Install directory [/usr/local/bin]: "
-  read -r INSTALL_DIR
-  INSTALL_DIR="${{INSTALL_DIR:-/usr/local/bin}}"
+  if [ -t 0 ] && [ -r /dev/tty ]; then
+    printf "Install directory [/usr/local/bin]: " > /dev/tty
+    read -r INSTALL_DIR < /dev/tty || true
+    INSTALL_DIR="${{INSTALL_DIR:-/usr/local/bin}}"
+  else
+    INSTALL_DIR="/usr/local/bin"
+  fi
 fi
 install -d "$INSTALL_DIR"
 install "$TMPDIR/$BINARY" "$INSTALL_DIR/$BINARY"
@@ -1244,7 +1248,14 @@ mod tests {
     fn generate_install_script_prompts_for_install_dir() {
         let script = generate_install_script("tool", "owner/repo", "1.0.0", GITHUB_BASE_URL);
         assert!(script.contains("printf \"Install directory [/usr/local/bin]: \""));
-        assert!(script.contains("read -r INSTALL_DIR"));
+        assert!(script.contains("read -r INSTALL_DIR < /dev/tty || true"));
+    }
+
+    #[test]
+    fn generate_install_script_defaults_install_dir_when_non_interactive() {
+        let script = generate_install_script("tool", "owner/repo", "1.0.0", GITHUB_BASE_URL);
+        assert!(script.contains("if [ -t 0 ] && [ -r /dev/tty ]; then"));
+        assert!(script.contains("INSTALL_DIR=\"/usr/local/bin\""));
     }
 
     // --- nix_system tests ---

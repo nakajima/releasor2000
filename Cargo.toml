@@ -4,6 +4,7 @@ version = "0.0.6"
 edition = "2024"
 description = "Release your bin everywhere*."
 license = "BSD-3-Clause"
+build = "build.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
