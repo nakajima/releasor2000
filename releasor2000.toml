@@ -4,7 +4,7 @@ auto-tag = true
 # binary = "releasor2000"  # defaults to project name
 # binaries = ["releasor2000", "releasor2000-helper"]  # optional extra release assets
 repo = "nakajima/releasor2000"
-# version_command = "git describe --tags --abbrev=0"
+# version-command = "git describe --tags --abbrev=0"
 
 [build]
 command = "cargo build --release --target {target}"
@@ -21,10 +21,10 @@ enabled = true
 
 [channels.homebrew]
 tap = "nakajima/homebrew-tap"
-formula_name = "releasor2000"
+formula-name = "releasor2000"
 
 # [channels.cargo]
-crate_name = "releasor2000"
+crate-name = "releasor2000"
 
 [channels.curl]
 

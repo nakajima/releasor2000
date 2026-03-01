@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::Path;
+use toml::Value;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -16,18 +17,24 @@ pub struct Config {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct Project {
     pub name: String,
     pub binary: Option<String>,
     pub binaries: Option<Vec<String>>,
     pub repo: String,
+    #[serde(alias = "version_command")]
     pub version_command: Option<String>,
+    #[serde(default, alias = "auto_tag")]
+    pub auto_tag: bool,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct Build {
     pub command: Option<String>,
     pub artifact: Option<String>,
+    #[serde(alias = "pre_built_dir")]
     pub pre_built_dir: Option<String>,
     pub targets: Vec<String>,
 }
@@ -46,11 +53,15 @@ impl Default for GitType {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct Git {
     #[serde(default)]
     pub r#type: GitType,
+    #[serde(alias = "base_url")]
     pub base_url: Option<String>,
+    #[serde(alias = "api_base_url")]
     pub api_base_url: Option<String>,
+    #[serde(alias = "token_env")]
     pub token_env: Option<String>,
 }
 
@@ -74,17 +85,21 @@ pub struct GitChannel {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct HomebrewChannel {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub tap: String,
+    #[serde(alias = "formula_name")]
     pub formula_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct CargoChannel {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(alias = "crate_name")]
     pub crate_name: Option<String>,
 }
 
@@ -95,9 +110,11 @@ pub struct CurlChannel {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct NixChannel {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(alias = "flake_repo")]
     pub flake_repo: Option<String>,
 }
 
@@ -167,10 +184,11 @@ pub fn generate_template(project_name: &str) -> String {
     format!(
         r#"[project]
 name = "{project_name}"
+# auto-tag = true  # detect Cargo.toml version, create/push git tag v<version> before releasing to git
 # binary = "{project_name}"  # defaults to project name
 # binaries = ["{project_name}", "{project_name}-cli"]  # optional extra release assets
 repo = "owner/{project_name}"
-# version_command = "git describe --tags --abbrev=0"
+# version-command = "git describe --tags --abbrev=0"
 
 [build]
 command = "cargo build --release --target {{target}}"
@@ -184,26 +202,125 @@ targets = [
 
 [git]
 # type = "gitea"                  # defaults to "github"
-# base_url = "https://git.example.com"
-# api_base_url = "https://git.example.com/api/v1"  # defaults from type/base_url
-# token_env = "GITEA_TOKEN"       # defaults: GITHUB_TOKEN or GITEA_TOKEN
+# base-url = "https://git.example.com"
+# api-base-url = "https://git.example.com/api/v1"  # defaults from type/base-url
+# token-env = "GITEA_TOKEN"       # defaults: GITHUB_TOKEN or GITEA_TOKEN
 
 [channels.git]
 enabled = true
 
 # [channels.homebrew]
 # tap = "owner/homebrew-tap"
-# formula_name = "{project_name}"
+# formula-name = "{project_name}"
 
 # [channels.cargo]
-# crate_name = "{project_name}"
+# crate-name = "{project_name}"
 
 # [channels.curl]
 
 # [channels.nix]
-# flake_repo = "owner/nix-repo"  # defaults to project repo
+# flake-repo = "owner/nix-repo"  # defaults to project repo
 "#
     )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KeyMigration {
+    table_path: &'static [&'static str],
+    dashed: &'static str,
+    underscored: &'static str,
+}
+
+const KEY_MIGRATIONS: &[KeyMigration] = &[
+    KeyMigration {
+        table_path: &["project"],
+        dashed: "auto-tag",
+        underscored: "auto_tag",
+    },
+    KeyMigration {
+        table_path: &["project"],
+        dashed: "version-command",
+        underscored: "version_command",
+    },
+    KeyMigration {
+        table_path: &["build"],
+        dashed: "pre-built-dir",
+        underscored: "pre_built_dir",
+    },
+    KeyMigration {
+        table_path: &["git"],
+        dashed: "base-url",
+        underscored: "base_url",
+    },
+    KeyMigration {
+        table_path: &["git"],
+        dashed: "api-base-url",
+        underscored: "api_base_url",
+    },
+    KeyMigration {
+        table_path: &["git"],
+        dashed: "token-env",
+        underscored: "token_env",
+    },
+    KeyMigration {
+        table_path: &["channels", "homebrew"],
+        dashed: "formula-name",
+        underscored: "formula_name",
+    },
+    KeyMigration {
+        table_path: &["channels", "cargo"],
+        dashed: "crate-name",
+        underscored: "crate_name",
+    },
+    KeyMigration {
+        table_path: &["channels", "nix"],
+        dashed: "flake-repo",
+        underscored: "flake_repo",
+    },
+];
+
+fn table_at_path<'a>(root: &'a Value, path: &[&str]) -> Option<&'a toml::map::Map<String, Value>> {
+    let mut value = root;
+    for segment in path {
+        value = value.get(*segment)?;
+    }
+    value.as_table()
+}
+
+fn full_key(path: &[&str], key: &str) -> String {
+    if path.is_empty() {
+        key.to_string()
+    } else {
+        format!("{}.{}", path.join("."), key)
+    }
+}
+
+fn check_key_migrations(raw: &Value) -> Result<()> {
+    for mapping in KEY_MIGRATIONS {
+        let Some(table) = table_at_path(raw, mapping.table_path) else {
+            continue;
+        };
+        let dashed = table.get(mapping.dashed);
+        let underscored = table.get(mapping.underscored);
+
+        if let Some(old_value) = underscored {
+            if let Some(new_value) = dashed {
+                if new_value != old_value {
+                    bail!(
+                        "conflicting config keys '{}' and '{}' have different values",
+                        full_key(mapping.table_path, mapping.dashed),
+                        full_key(mapping.table_path, mapping.underscored)
+                    );
+                }
+            }
+            eprintln!(
+                "Warning: config key '{}' is deprecated; use '{}'",
+                full_key(mapping.table_path, mapping.underscored),
+                full_key(mapping.table_path, mapping.dashed)
+            );
+        }
+    }
+    Ok(())
 }
 
 impl Config {
@@ -214,7 +331,9 @@ impl Config {
     }
 
     pub fn parse(content: &str) -> Result<Self> {
-        let config: Config = toml::from_str(content).context("parsing config")?;
+        let raw: Value = toml::from_str(content).context("parsing config")?;
+        check_key_migrations(&raw)?;
+        let config: Config = raw.try_into().context("parsing config")?;
         config.validate()?;
         Ok(config)
     }
@@ -254,10 +373,10 @@ impl Config {
             }
         }
         if self.build.command.is_some() && self.build.pre_built_dir.is_some() {
-            bail!("build.command and build.pre_built_dir are mutually exclusive");
+            bail!("build.command and build.pre-built-dir are mutually exclusive");
         }
         if self.build.command.is_none() && self.build.pre_built_dir.is_none() {
-            bail!("one of build.command or build.pre_built_dir is required");
+            bail!("one of build.command or build.pre-built-dir is required");
         }
         if self.build.command.is_some() && self.build.artifact.is_none() {
             bail!("build.artifact is required when build.command is set");
@@ -326,6 +445,7 @@ targets = ["x86_64-apple-darwin"]
         assert!(config.project.binary.is_none());
         assert!(config.project.binaries.is_none());
         assert!(config.project.version_command.is_none());
+        assert!(!config.project.auto_tag);
         assert_eq!(config.build.targets.len(), 1);
         assert!(config.enabled_channels().is_empty());
     }
@@ -342,7 +462,7 @@ targets = ["x86_64-apple-darwin"]
     #[test]
     fn git_gitea_defaults_from_base_url() {
         let toml = format!(
-            "{}\n[git]\ntype = \"gitea\"\nbase_url = \"https://git.example.com\"\n",
+            "{}\n[git]\ntype = \"gitea\"\nbase-url = \"https://git.example.com\"\n",
             minimal_toml()
         );
         let config = Config::parse(&toml).unwrap();
@@ -355,7 +475,7 @@ targets = ["x86_64-apple-darwin"]
     #[test]
     fn git_allows_custom_api_and_token() {
         let toml = format!(
-            "{}\n[git]\ntype = \"gitea\"\nbase_url = \"https://git.example.com\"\napi_base_url = \"https://git.example.com/custom-api\"\ntoken_env = \"MY_TOKEN\"\n",
+            "{}\n[git]\ntype = \"gitea\"\nbase-url = \"https://git.example.com\"\napi-base-url = \"https://git.example.com/custom-api\"\ntoken-env = \"MY_TOKEN\"\n",
             minimal_toml()
         );
         let config = Config::parse(&toml).unwrap();
@@ -369,7 +489,7 @@ targets = ["x86_64-apple-darwin"]
     #[test]
     fn git_blank_api_base_url_uses_default() {
         let toml = format!(
-            "{}\n[git]\ntype = \"gitea\"\nbase_url = \"https://git.example.com\"\napi_base_url = \"   \"\n",
+            "{}\n[git]\ntype = \"gitea\"\nbase-url = \"https://git.example.com\"\napi-base-url = \"   \"\n",
             minimal_toml()
         );
         let config = Config::parse(&toml).unwrap();
@@ -516,7 +636,7 @@ name = "myapp"
 repo = "owner/repo"
 
 [build]
-pre_built_dir = "dist/"
+pre-built-dir = "dist/"
 targets = ["x86_64-apple-darwin"]
 "#;
         let config = Config::parse(toml).unwrap();
@@ -534,7 +654,7 @@ repo = "owner/repo"
 [build]
 command = "make"
 artifact = "out/bin"
-pre_built_dir = "dist/"
+pre-built-dir = "dist/"
 targets = ["x86_64-apple-darwin"]
 "#;
         let err = Config::parse(toml).unwrap_err();
@@ -554,7 +674,7 @@ targets = ["x86_64-apple-darwin"]
         let err = Config::parse(toml).unwrap_err();
         assert!(
             err.to_string()
-                .contains("one of build.command or build.pre_built_dir is required"),
+                .contains("one of build.command or build.pre-built-dir is required"),
             "got: {err}"
         );
     }
@@ -686,7 +806,7 @@ enabled = true
     #[test]
     fn forge_section_is_rejected() {
         let toml = format!(
-            "{}\n[forge]\ntype = \"gitea\"\nbase_url = \"https://git.example.com\"\n",
+            "{}\n[forge]\ntype = \"gitea\"\nbase-url = \"https://git.example.com\"\n",
             minimal_toml()
         );
         let err = Config::parse(&toml).unwrap_err();
@@ -711,7 +831,7 @@ targets = ["x86_64-apple-darwin"]
 
 [channels.cargo]
 enabled = false
-crate_name = "myapp"
+crate-name = "myapp"
 "#;
         let config = Config::parse(toml).unwrap();
         assert!(config.enabled_channels().is_empty());
@@ -738,7 +858,7 @@ crate_name = "myapp"
 name = "myapp"
 binary = "myapp"
 repo = "owner/repo"
-version_command = "git describe --tags --abbrev=0"
+version-command = "git describe --tags --abbrev=0"
 
 [build]
 command = "cargo build --release --target {target}"
@@ -755,17 +875,17 @@ enabled = true
 
 [channels.homebrew]
 tap = "owner/homebrew-tap"
-formula_name = "myapp"
+formula-name = "myapp"
 
 [channels.cargo]
 enabled = false
-crate_name = "myapp"
+crate-name = "myapp"
 
 [channels.curl]
 url = "https://myapp.dev/install.sh"
 
 [channels.nix]
-flake_repo = "owner/nix-repo"
+flake-repo = "owner/nix-repo"
 "#;
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.project.name, "myapp");
@@ -808,10 +928,10 @@ enabled = true
 
 [channels.homebrew]
 tap = "nakajima/homebrew-tap"
-formula_name = "releasor2000"
+formula-name = "releasor2000"
 
 # [channels.cargo]
-crate_name = "releasor2000"
+crate-name = "releasor2000"
 
 [channels.curl]
 
@@ -821,6 +941,63 @@ crate_name = "releasor2000"
         assert_eq!(
             config.enabled_channels(),
             vec!["git", "homebrew", "curl", "nix"]
+        );
+    }
+
+    #[test]
+    fn parse_auto_tag_from_kebab_case() {
+        let toml = r#"
+[project]
+name = "myapp"
+repo = "owner/repo"
+auto-tag = true
+
+[build]
+command = "make"
+artifact = "out/{binary}"
+targets = ["x86_64-apple-darwin"]
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert!(config.project.auto_tag);
+    }
+
+    #[test]
+    fn parse_auto_tag_from_underscore_alias() {
+        let toml = r#"
+[project]
+name = "myapp"
+repo = "owner/repo"
+auto_tag = true
+
+[build]
+command = "make"
+artifact = "out/{binary}"
+targets = ["x86_64-apple-darwin"]
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert!(config.project.auto_tag);
+    }
+
+    #[test]
+    fn parse_conflicting_key_styles_fails() {
+        let toml = r#"
+[project]
+name = "myapp"
+repo = "owner/repo"
+version-command = "cargo metadata --no-deps"
+version_command = "git describe --tags --abbrev=0"
+
+[build]
+command = "make"
+artifact = "out/{binary}"
+targets = ["x86_64-apple-darwin"]
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "conflicting config keys 'project.version-command' and 'project.version_command'"
+            ),
+            "got: {err}"
         );
     }
 }

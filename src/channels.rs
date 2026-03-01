@@ -3,6 +3,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use toml::Value as TomlValue;
 
 use crate::config::{Config, GitType};
 
@@ -165,21 +166,121 @@ fn substitute(template: &str, vars: &[(&str, &str)]) -> String {
     result
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectKind {
+    Rust,
+}
+
+fn normalize_version(v: &str) -> String {
+    v.strip_prefix('v').unwrap_or(v).trim().to_string()
+}
+
+fn detect_project_kind() -> Result<ProjectKind> {
+    if Path::new("Cargo.toml").exists() {
+        return Ok(ProjectKind::Rust);
+    }
+    bail!(
+        "auto-tag is enabled, but no supported manifest was found in the current directory (expected Cargo.toml for Rust projects)"
+    )
+}
+
+fn rust_manifest_version(manifest_path: &Path) -> Result<String> {
+    let manifest = std::fs::read_to_string(manifest_path)
+        .with_context(|| format!("failed reading {}", manifest_path.display()))?;
+    let parsed: TomlValue = toml::from_str(&manifest)
+        .with_context(|| format!("failed parsing {}", manifest_path.display()))?;
+    let package = parsed
+        .get("package")
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} is missing [package]; workspace roots without package.version are not supported by auto-tag. Pass --version or disable project.auto-tag for now.",
+                manifest_path.display()
+            )
+        })?;
+    let version = package
+        .get("version")
+        .and_then(TomlValue::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} is missing package.version; workspace roots without package.version are not supported by auto-tag. Pass --version or disable project.auto-tag for now.",
+                manifest_path.display()
+            )
+        })?;
+    Ok(version.to_string())
+}
+
+fn detect_manifest_version() -> Result<String> {
+    match detect_project_kind()? {
+        ProjectKind::Rust => rust_manifest_version(Path::new("Cargo.toml")),
+    }
+}
+
+fn local_tag_exists(tag: &str) -> Result<bool> {
+    let ref_name = format!("refs/tags/{tag}");
+    let output = Command::new("git")
+        .args(["rev-parse", "-q", "--verify", &ref_name])
+        .output()
+        .context("[tag] failed to run git rev-parse")?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!("[tag] could not check local tag {tag}: {stderr}");
+}
+
+fn remote_tag_exists(tag: &str) -> Result<bool> {
+    let ref_name = format!("refs/tags/{tag}");
+    let output = Command::new("git")
+        .args(["ls-remote", "--exit-code", "--tags", "origin", &ref_name])
+        .output()
+        .context("[tag] failed to run git ls-remote")?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if output.status.code() == Some(2) {
+        return Ok(false);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!("[tag] could not check remote tag {tag} on origin: {stderr}");
+}
+
+fn create_and_push_tag(version: &str) -> Result<()> {
+    let tag = format!("v{version}");
+    if local_tag_exists(&tag)? {
+        bail!("[tag] tag {tag} already exists locally");
+    }
+    if remote_tag_exists(&tag)? {
+        bail!("[tag] tag {tag} already exists on origin");
+    }
+
+    let message = format!("Release {tag}");
+    run_cmd("tag", None, "git", &["tag", "-a", &tag, "-m", &message])?;
+    run_cmd("tag", None, "git", &["push", "origin", &tag])?;
+    println!("[tag] Created and pushed {tag}");
+    Ok(())
+}
+
 fn detect_version(config: &Config, version_override: Option<&str>) -> Result<String> {
     if let Some(v) = version_override {
-        return Ok(v.strip_prefix('v').unwrap_or(v).to_string());
+        return Ok(normalize_version(v));
     }
     let raw = if let Some(cmd) = &config.project.version_command {
         let parts: Vec<&str> = cmd.split_whitespace().collect();
         let (bin, args) = parts
             .split_first()
-            .ok_or_else(|| anyhow::anyhow!("empty version_command"))?;
-        run_cmd("version", None, bin, args).context("version_command failed")?
+            .ok_or_else(|| anyhow::anyhow!("empty version-command"))?;
+        run_cmd("version", None, bin, args).context("version-command failed")?
     } else {
         run_cmd("version", None, "git", &["describe", "--tags", "--abbrev=0"])
-            .context("could not detect version from git tags — use --version or set version_command in config")?
+            .context("could not detect version from git tags — use --version or set version-command in config")?
     };
-    Ok(raw.strip_prefix('v').unwrap_or(&raw).to_string())
+    Ok(normalize_version(&raw))
 }
 
 fn confirm(prompt: &str) -> Result<bool> {
@@ -447,7 +548,7 @@ fn command_exists(cmd: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-fn preflight(git: &GitContext, selected: &[&str]) -> Result<()> {
+fn preflight(git: &GitContext, selected: &[&str], auto_tag_enabled: bool) -> Result<()> {
     let mut missing = Vec::new();
 
     let needs_git_api = selected
@@ -472,6 +573,10 @@ fn preflight(git: &GitContext, selected: &[&str]) -> Result<()> {
 
     if selected.contains(&"cargo") && !command_exists("cargo") {
         missing.push("cargo command is required for: cargo".to_string());
+    }
+
+    if auto_tag_enabled && !command_exists("git") {
+        missing.push("git command is required when project.auto-tag is enabled".to_string());
     }
 
     let depends_on_git = selected
@@ -523,9 +628,29 @@ pub fn release(
         return Ok(());
     }
 
-    preflight(&git, &selected)?;
+    let auto_tag_enabled = config.project.auto_tag && selected.contains(&"git");
+    preflight(&git, &selected, auto_tag_enabled)?;
 
-    let version = detect_version(config, version_override)?;
+    let version = if auto_tag_enabled {
+        let manifest_version = detect_manifest_version()?;
+        if let Some(override_version) = version_override {
+            let normalized_override = normalize_version(override_version);
+            if normalized_override != manifest_version {
+                bail!(
+                    "--version ({normalized_override}) does not match manifest version ({manifest_version}) while project.auto-tag is enabled"
+                );
+            }
+        }
+        println!("[tag] Using manifest version {manifest_version} from Cargo.toml");
+        manifest_version
+    } else {
+        detect_version(config, version_override)?
+    };
+
+    if auto_tag_enabled {
+        create_and_push_tag(&version)?;
+    }
+
     println!(
         "Releasing {} v{version} via: {}",
         config.project.name,
@@ -1157,6 +1282,55 @@ mod tests {
         assert_eq!(parse_host_target("no host here\n"), None);
     }
 
+    #[test]
+    fn normalize_version_strips_v_prefix() {
+        assert_eq!(normalize_version("v1.2.3"), "1.2.3");
+        assert_eq!(normalize_version("1.2.3"), "1.2.3");
+    }
+
+    fn write_temp_manifest(content: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("releasor2000-test-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Cargo.toml");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn rust_manifest_version_reads_package_version() {
+        let path = write_temp_manifest(
+            r#"
+[package]
+name = "mytool"
+version = "1.2.3"
+"#,
+        );
+        let version = rust_manifest_version(&path).unwrap();
+        assert_eq!(version, "1.2.3");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn rust_manifest_version_rejects_missing_package_version() {
+        let path = write_temp_manifest(
+            r#"
+[workspace]
+members = ["app"]
+"#,
+        );
+        let err = rust_manifest_version(&path).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("workspace roots without package.version are not supported"),
+            "got: {err}"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
     // --- needs_cross_linker tests ---
 
     #[test]
@@ -1400,7 +1574,7 @@ mod tests {
     #[test]
     fn preflight_ok_with_no_channels() {
         let git = github_git();
-        assert!(preflight(&git, &[]).is_ok());
+        assert!(preflight(&git, &[], false).is_ok());
     }
 
     #[test]
@@ -1410,7 +1584,7 @@ mod tests {
         unsafe { std::env::remove_var("GITHUB_TOKEN") };
 
         let git = github_git();
-        let err = preflight(&git, &["git"]).unwrap_err();
+        let err = preflight(&git, &["git"], false).unwrap_err();
         assert!(err.to_string().contains("GITHUB_TOKEN"), "got: {err}");
 
         if let Some(val) = saved {
@@ -1430,7 +1604,7 @@ mod tests {
             accept_header: "application/json",
             is_github: false,
         };
-        let err = preflight(&git, &["git"]).unwrap_err();
+        let err = preflight(&git, &["git"], false).unwrap_err();
         assert!(err.to_string().contains("GITEA_TOKEN"), "got: {err}");
         if let Some(val) = saved {
             unsafe { std::env::set_var("GITEA_TOKEN", val) };
@@ -1451,7 +1625,7 @@ mod tests {
         unsafe { std::env::set_var("GITHUB_TOKEN", "fake-token-for-test") };
 
         let git = github_git();
-        let err = preflight(&git, &["git", "nix"]).unwrap_err();
+        let err = preflight(&git, &["git", "nix"], false).unwrap_err();
         assert!(err.to_string().contains("nix command"), "got: {err}");
 
         match saved {
@@ -1468,7 +1642,7 @@ mod tests {
 
         let git = github_git();
         for ch in &["homebrew", "curl", "nix"] {
-            let err = preflight(&git, &[*ch]).unwrap_err();
+            let err = preflight(&git, &[*ch], false).unwrap_err();
             assert!(
                 err.to_string().contains("git channel must be selected"),
                 "channel {ch}: got: {err}"
@@ -1479,5 +1653,18 @@ mod tests {
             Some(val) => unsafe { std::env::set_var("GITHUB_TOKEN", val) },
             None => unsafe { std::env::remove_var("GITHUB_TOKEN") },
         }
+    }
+
+    #[test]
+    fn preflight_requires_git_command_when_auto_tag_enabled() {
+        if command_exists("git") {
+            return;
+        }
+        let git = github_git();
+        let err = preflight(&git, &["git"], true).unwrap_err();
+        assert!(
+            err.to_string().contains("git command is required"),
+            "got: {err}"
+        );
     }
 }
