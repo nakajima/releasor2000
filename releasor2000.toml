@@ -1,5 +1,6 @@
 [project]
 name = "releasor2000"
+auto-tag = true
 # binary = "releasor2000"  # defaults to project name
 # binaries = ["releasor2000", "releasor2000-helper"]  # optional extra release assets
 repo = "nakajima/releasor2000"
