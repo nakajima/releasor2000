@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use toml::Value as TomlValue;
@@ -342,6 +342,38 @@ fn installed_targets() -> HashSet<String> {
         .unwrap_or_default()
 }
 
+fn linux_musl_variant(target: &str) -> Option<String> {
+    target
+        .strip_suffix("-unknown-linux-gnu")
+        .map(|prefix| format!("{prefix}-unknown-linux-musl"))
+}
+
+fn release_targets_for_build(targets: &[String], nix_selected: bool) -> Vec<String> {
+    let mut expanded = targets.to_vec();
+    if !nix_selected {
+        return expanded;
+    }
+
+    let mut extra = Vec::new();
+    for target in targets {
+        let Some(musl_target) = linux_musl_variant(target) else {
+            continue;
+        };
+        if expanded.contains(&musl_target) || extra.contains(&musl_target) {
+            continue;
+        }
+        extra.push(musl_target);
+    }
+    if !extra.is_empty() {
+        eprintln!(
+            "[build] Nix channel selected: adding static Linux targets: {}",
+            extra.join(", ")
+        );
+        expanded.extend(extra);
+    }
+    expanded
+}
+
 #[derive(Debug, Clone)]
 struct BuiltArchive {
     binary: String,
@@ -350,8 +382,13 @@ struct BuiltArchive {
     archive_path: PathBuf,
 }
 
-fn build_artifacts(config: &Config, version: &str) -> Result<Vec<BuiltArchive>> {
+fn build_artifacts(
+    config: &Config,
+    version: &str,
+    nix_selected: bool,
+) -> Result<Vec<BuiltArchive>> {
     let binaries = config.project.release_binaries();
+    let targets = release_targets_for_build(&config.build.targets, nix_selected);
     let staging = PathBuf::from("target/release-staging");
     std::fs::create_dir_all(&staging)?;
 
@@ -360,9 +397,9 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<BuiltArchive>> 
 
     let mut archives = Vec::new();
     let mut failed_pairs: Vec<(String, String)> = Vec::new();
-    let total_attempts = config.build.targets.len() * binaries.len();
+    let total_attempts = targets.len() * binaries.len();
 
-    for target in &config.build.targets {
+    for target in &targets {
         for binary in &binaries {
             let vars = &[
                 ("target", target.as_str()),
@@ -670,7 +707,7 @@ pub fn release(
         }
     }
 
-    let archives = build_artifacts(config, &version)?;
+    let archives = build_artifacts(config, &version, selected.contains(&"nix"))?;
 
     // Run git first so other channels can reference release URLs
     let ordered: Vec<&str> = {
@@ -954,6 +991,56 @@ fn nix_system(target: &str) -> Option<&'static str> {
     }
 }
 
+fn is_linux_target(target: &str) -> bool {
+    target.contains("linux")
+}
+
+fn is_linux_musl_target(target: &str) -> bool {
+    target.contains("linux-musl")
+}
+
+#[derive(Debug, Clone)]
+struct NixSystemHash {
+    nix_system: String,
+    rust_target: String,
+    sha256: String,
+}
+
+fn select_nix_system_hashes(candidates: Vec<NixSystemHash>) -> Result<Vec<NixSystemHash>> {
+    let mut by_system: BTreeMap<String, Vec<NixSystemHash>> = BTreeMap::new();
+    for candidate in candidates {
+        by_system
+            .entry(candidate.nix_system.clone())
+            .or_default()
+            .push(candidate);
+    }
+
+    let mut selected = Vec::new();
+    for (nix_system, group) in by_system {
+        if is_linux_target(&nix_system) {
+            if let Some(musl) = group
+                .iter()
+                .find(|candidate| is_linux_musl_target(&candidate.rust_target))
+            {
+                selected.push(musl.clone());
+                continue;
+            }
+            let available: Vec<String> = group
+                .iter()
+                .map(|candidate| candidate.rust_target.clone())
+                .collect();
+            bail!(
+                "[nix] Linux packages require static musl assets when nix channel is enabled. Missing *-unknown-linux-musl asset for {nix_system}; found: {}",
+                available.join(", ")
+            );
+        }
+        if let Some(first) = group.into_iter().next() {
+            selected.push(first);
+        }
+    }
+    Ok(selected)
+}
+
 fn generate_flake(
     name: &str,
     binary: &str,
@@ -1063,12 +1150,23 @@ fn release_nix(
         )?;
         let hash = sha256(&tmp_path)?;
         std::fs::remove_file(&tmp_path).ok();
-        system_hashes.push((nix_sys, target.as_str(), hash));
+        system_hashes.push(NixSystemHash {
+            nix_system: nix_sys.to_string(),
+            rust_target: target.clone(),
+            sha256: hash,
+        });
     }
 
-    let system_hash_refs: Vec<(&str, &str, &str)> = system_hashes
+    let selected_system_hashes = select_nix_system_hashes(system_hashes)?;
+    let system_hash_refs: Vec<(&str, &str, &str)> = selected_system_hashes
         .iter()
-        .map(|(s, t, h)| (*s, *t, h.as_str()))
+        .map(|entry| {
+            (
+                entry.nix_system.as_str(),
+                entry.rust_target.as_str(),
+                entry.sha256.as_str(),
+            )
+        })
         .collect();
 
     let flake = generate_flake(
@@ -1392,6 +1490,49 @@ members = ["app"]
         assert!(result.contains("x86_64-apple-darwin"));
     }
 
+    // --- release_targets_for_build tests ---
+
+    #[test]
+    fn release_targets_for_build_keeps_defaults_when_nix_not_selected() {
+        let targets = vec![
+            "x86_64-unknown-linux-gnu".to_string(),
+            "aarch64-apple-darwin".to_string(),
+        ];
+        let expanded = release_targets_for_build(&targets, false);
+        assert_eq!(expanded, targets);
+    }
+
+    #[test]
+    fn release_targets_for_build_adds_linux_musl_variants_for_nix() {
+        let targets = vec![
+            "x86_64-unknown-linux-gnu".to_string(),
+            "aarch64-unknown-linux-gnu".to_string(),
+            "aarch64-apple-darwin".to_string(),
+        ];
+        let expanded = release_targets_for_build(&targets, true);
+        assert!(expanded.contains(&"x86_64-unknown-linux-musl".to_string()));
+        assert!(expanded.contains(&"aarch64-unknown-linux-musl".to_string()));
+        assert!(expanded.contains(&"x86_64-unknown-linux-gnu".to_string()));
+        assert!(expanded.contains(&"aarch64-unknown-linux-gnu".to_string()));
+        assert!(expanded.contains(&"aarch64-apple-darwin".to_string()));
+    }
+
+    #[test]
+    fn release_targets_for_build_does_not_duplicate_existing_musl_targets() {
+        let targets = vec![
+            "x86_64-unknown-linux-gnu".to_string(),
+            "x86_64-unknown-linux-musl".to_string(),
+        ];
+        let expanded = release_targets_for_build(&targets, true);
+        assert_eq!(
+            expanded
+                .iter()
+                .filter(|target| target.as_str() == "x86_64-unknown-linux-musl")
+                .count(),
+            1
+        );
+    }
+
     // --- generate_install_script tests ---
 
     #[test]
@@ -1440,6 +1581,14 @@ members = ["app"]
     }
 
     #[test]
+    fn nix_system_x86_64_linux_musl() {
+        assert_eq!(
+            nix_system("x86_64-unknown-linux-musl"),
+            Some("x86_64-linux")
+        );
+    }
+
+    #[test]
     fn nix_system_aarch64_linux() {
         assert_eq!(
             nix_system("aarch64-unknown-linux-gnu"),
@@ -1460,6 +1609,53 @@ members = ["app"]
     #[test]
     fn nix_system_unknown_target() {
         assert_eq!(nix_system("wasm32-unknown-unknown"), None);
+    }
+
+    // --- select_nix_system_hashes tests ---
+
+    #[test]
+    fn select_nix_system_hashes_prefers_musl_on_linux() {
+        let selected = select_nix_system_hashes(vec![
+            NixSystemHash {
+                nix_system: "x86_64-linux".to_string(),
+                rust_target: "x86_64-unknown-linux-gnu".to_string(),
+                sha256: "gnu".to_string(),
+            },
+            NixSystemHash {
+                nix_system: "x86_64-linux".to_string(),
+                rust_target: "x86_64-unknown-linux-musl".to_string(),
+                sha256: "musl".to_string(),
+            },
+            NixSystemHash {
+                nix_system: "aarch64-darwin".to_string(),
+                rust_target: "aarch64-apple-darwin".to_string(),
+                sha256: "darwin".to_string(),
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(selected.len(), 2);
+        assert!(
+            selected
+                .iter()
+                .any(|entry| entry.rust_target == "x86_64-unknown-linux-musl")
+        );
+        assert!(
+            selected
+                .iter()
+                .any(|entry| entry.rust_target == "aarch64-apple-darwin")
+        );
+    }
+
+    #[test]
+    fn select_nix_system_hashes_errors_without_musl_linux_asset() {
+        let err = select_nix_system_hashes(vec![NixSystemHash {
+            nix_system: "x86_64-linux".to_string(),
+            rust_target: "x86_64-unknown-linux-gnu".to_string(),
+            sha256: "gnu".to_string(),
+        }])
+        .unwrap_err();
+        assert!(err.to_string().contains("Missing *-unknown-linux-musl"));
     }
 
     // --- generate_flake tests ---
