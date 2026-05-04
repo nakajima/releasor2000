@@ -18,6 +18,7 @@ pub struct Config {
 pub struct Project {
     pub name: String,
     pub binary: Option<String>,
+    pub package: Option<String>,
     pub repo: String,
     pub version_command: Option<String>,
 }
@@ -152,6 +153,7 @@ pub fn generate_template(project_name: &str) -> String {
         r#"[project]
 name = "{project_name}"
 # binary = "{project_name}"  # defaults to project name
+# package = "{project_name}"  # optional workspace package override; auto-detected from binary when unique
 repo = "owner/{project_name}"
 # version_command = "git describe --tags --abbrev=0"
 
@@ -283,6 +285,7 @@ targets = ["x86_64-apple-darwin"]
         assert_eq!(config.project.repo, "owner/repo");
         assert_eq!(config.project.binary(), "myapp");
         assert!(config.project.binary.is_none());
+        assert!(config.project.package.is_none());
         assert!(config.project.version_command.is_none());
         assert_eq!(config.build.targets.len(), 1);
         assert!(config.enabled_channels().is_empty());
@@ -355,6 +358,23 @@ targets = ["x86_64-apple-darwin"]
 "#;
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.project.binary(), "myapp-bin");
+    }
+
+    #[test]
+    fn package_override() {
+        let toml = r#"
+[project]
+name = "myapp"
+package = "myapp-cli"
+repo = "owner/repo"
+
+[build]
+command = "make"
+artifact = "out/{binary}"
+targets = ["x86_64-apple-darwin"]
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.project.package.as_deref(), Some("myapp-cli"));
     }
 
     #[test]

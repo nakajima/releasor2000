@@ -237,6 +237,245 @@ fn linker_env_var(target: &str) -> String {
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CargoPackageSelection {
+    name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CargoWorkspacePackage {
+    name: String,
+    binary_targets: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CargoWorkspace {
+    packages: Vec<CargoWorkspacePackage>,
+}
+
+impl CargoWorkspace {
+    fn load() -> Result<Self> {
+        let output = Command::new("cargo")
+            .args(["metadata", "--no-deps", "--format-version", "1"])
+            .output()
+            .context("failed to run cargo metadata")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("cargo metadata failed: {stderr}");
+        }
+        Self::from_metadata_json(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    fn from_metadata_json(metadata_json: &str) -> Result<Self> {
+        let metadata: serde_json::Value =
+            serde_json::from_str(metadata_json).context("parsing cargo metadata")?;
+        let workspace_members = metadata["workspace_members"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("cargo metadata missing workspace_members"))?;
+        let member_ids: HashSet<String> = workspace_members
+            .iter()
+            .filter_map(|member| member.as_str().map(str::to_string))
+            .collect();
+        let packages = metadata["packages"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("cargo metadata missing packages"))?;
+
+        let mut workspace_packages = Vec::new();
+        for package in packages {
+            let Some(id) = package["id"].as_str() else {
+                continue;
+            };
+            if !member_ids.contains(id) {
+                continue;
+            }
+            let Some(name) = package["name"].as_str() else {
+                continue;
+            };
+
+            let mut binary_targets = Vec::new();
+            if let Some(targets) = package["targets"].as_array() {
+                for target in targets {
+                    let is_bin = target["kind"]
+                        .as_array()
+                        .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("bin")));
+                    if !is_bin {
+                        continue;
+                    }
+                    let Some(target_name) = target["name"].as_str() else {
+                        continue;
+                    };
+                    if !binary_targets.iter().any(|name| name == target_name) {
+                        binary_targets.push(target_name.to_string());
+                    }
+                }
+            }
+
+            workspace_packages.push(CargoWorkspacePackage {
+                name: name.to_string(),
+                binary_targets,
+            });
+        }
+
+        Ok(Self {
+            packages: workspace_packages,
+        })
+    }
+
+    fn package_for_binary(&self, binary: &str) -> Result<Option<CargoPackageSelection>> {
+        let matches: Vec<&str> = self
+            .packages
+            .iter()
+            .filter(|package| package.binary_targets.iter().any(|target| target == binary))
+            .map(|package| package.name.as_str())
+            .collect();
+
+        match matches.as_slice() {
+            [] => Ok(None),
+            [name] => Ok(Some(CargoPackageSelection {
+                name: (*name).to_string(),
+            })),
+            names => bail!(
+                "could not infer cargo package: binary {binary} is provided by multiple workspace packages ({}); set project.package",
+                names.join(", ")
+            ),
+        }
+    }
+
+    fn is_multi_package(&self) -> bool {
+        self.packages.len() > 1
+    }
+}
+
+impl CargoPackageSelection {
+    fn resolve(config: &Config, selected: &[&str]) -> Result<Option<Self>> {
+        if let Some(package) = &config.project.package {
+            return Ok(Some(Self {
+                name: package.clone(),
+            }));
+        }
+
+        if !Self::should_detect(config, selected) {
+            return Ok(None);
+        }
+
+        let package_required =
+            selected.contains(&"cargo") || Self::templates_require_package(config);
+        let workspace = match CargoWorkspace::load() {
+            Ok(workspace) => workspace,
+            Err(err) => {
+                if package_required {
+                    return Err(err.context("detecting cargo workspace package"));
+                }
+                return Ok(None);
+            }
+        };
+
+        let binary = config.project.binary();
+        if let Some(package) = workspace.package_for_binary(binary)? {
+            return Ok(Some(package));
+        }
+
+        if Self::templates_require_package(config) {
+            bail!(
+                "could not resolve {{package}}: no workspace package provides binary {binary}; set project.package"
+            );
+        }
+
+        if selected.contains(&"cargo") && workspace.is_multi_package() {
+            bail!(
+                "could not infer cargo package: no workspace package provides binary {binary}; set project.package"
+            );
+        }
+
+        Ok(None)
+    }
+
+    fn should_detect(config: &Config, selected: &[&str]) -> bool {
+        selected.contains(&"cargo")
+            || Self::templates_require_package(config)
+            || config
+                .build
+                .command
+                .as_ref()
+                .is_some_and(|command| is_cargo_build_like_command(command))
+    }
+
+    fn templates_require_package(config: &Config) -> bool {
+        config
+            .build
+            .command
+            .as_ref()
+            .is_some_and(|template| template.contains("{package}"))
+            || config
+                .build
+                .artifact
+                .as_ref()
+                .is_some_and(|template| template.contains("{package}"))
+            || config
+                .build
+                .pre_built_dir
+                .as_ref()
+                .is_some_and(|template| template.contains("{package}"))
+    }
+
+    fn augment_build_command(&self, cmd_str: &str, binary: &str) -> String {
+        if !is_cargo_build_like_command(cmd_str) {
+            return cmd_str.to_string();
+        }
+
+        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+        if parts
+            .iter()
+            .any(|part| *part == "--workspace" || *part == "--all")
+        {
+            return cmd_str.to_string();
+        }
+
+        let mut additions = Vec::new();
+        if !has_package_selector(&parts) {
+            additions.push(format!("--package {}", self.name));
+        }
+        if !has_binary_selector(&parts) {
+            additions.push(format!("--bin {binary}"));
+        }
+
+        if additions.is_empty() {
+            cmd_str.to_string()
+        } else {
+            format!("{cmd_str} {}", additions.join(" "))
+        }
+    }
+}
+
+fn is_cargo_build_like_command(cmd_str: &str) -> bool {
+    let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+    matches!(
+        parts.as_slice(),
+        ["cargo", "build", ..] | ["cargo", "zigbuild", ..] | ["cross", "build", ..]
+    )
+}
+
+fn has_package_selector(parts: &[&str]) -> bool {
+    parts.iter().any(|part| {
+        *part == "--package"
+            || part.starts_with("--package=")
+            || *part == "-p"
+            || part.starts_with("-p")
+    })
+}
+
+fn has_binary_selector(parts: &[&str]) -> bool {
+    parts.iter().any(|part| {
+        *part == "--bin"
+            || part.starts_with("--bin=")
+            || *part == "--bins"
+            || *part == "--all-targets"
+            || *part == "--lib"
+            || *part == "--example"
+            || part.starts_with("--example=")
+    })
+}
+
 enum CargoBuildPlan {
     RunAsIs,
     ReplaceCommand {
@@ -287,6 +526,18 @@ fn parse_installed_targets(output: &str) -> HashSet<String> {
         .collect()
 }
 
+fn parse_command(cmd_str: &str) -> Result<(&str, Vec<&str>)> {
+    let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+    let (bin, args) = parts
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("empty command"))?;
+    Ok((bin, args.to_vec()))
+}
+
+fn is_process_fd_quota_exceeded(err: &str) -> bool {
+    err.contains("ProcessFdQuotaExceeded")
+}
+
 fn installed_targets() -> HashSet<String> {
     Command::new("rustup")
         .args(["target", "list", "--installed"])
@@ -297,7 +548,11 @@ fn installed_targets() -> HashSet<String> {
         .unwrap_or_default()
 }
 
-fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBuf)>> {
+fn build_artifacts(
+    config: &Config,
+    version: &str,
+    cargo_package: Option<&CargoPackageSelection>,
+) -> Result<Vec<(String, PathBuf)>> {
     let binary = config.project.binary();
     let staging = PathBuf::from("target/release-staging");
     std::fs::create_dir_all(&staging)?;
@@ -309,15 +564,20 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
     let mut archives = Vec::new();
     let mut failed = Vec::new();
     for target in &config.build.targets {
+        let package = cargo_package
+            .map(|package| package.name.as_str())
+            .unwrap_or("");
         let vars = &[
             ("target", target.as_str()),
             ("binary", binary),
+            ("package", package),
             ("version", version),
         ];
 
         let artifact_path = if let Some(cmd_template) = &config.build.command {
             let mut cmd_str = substitute(cmd_template, vars);
             let cross_needed = needs_cross_linker(&host, target);
+            let mut using_zigbuild = false;
 
             if cmd_str.contains("cargo build") {
                 match plan_cargo_build(&host, target, zigbuild_available, cross_available) {
@@ -337,6 +597,7 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
                             "[build] Using {tool_name} for cross-compilation target {target}"
                         );
                         cmd_str = cmd_str.replacen("cargo build", replacement, 1);
+                        using_zigbuild = tool_name == "cargo-zigbuild";
                     }
                     CargoBuildPlan::Skip(reason) => {
                         eprintln!("[build] Warning: target {target} skipped: {reason}");
@@ -346,14 +607,43 @@ fn build_artifacts(config: &Config, version: &str) -> Result<Vec<(String, PathBu
                 }
             }
 
-            let parts: Vec<&str> = cmd_str.split_whitespace().collect();
-            let (bin, args) = parts
-                .split_first()
-                .ok_or_else(|| anyhow::anyhow!("empty build command"))?;
-            if let Err(e) = run_cmd("build", None, bin, args) {
-                eprintln!("[build] Warning: target {target} failed: {e}");
-                failed.push(target.clone());
-                continue;
+            if let Some(package) = cargo_package {
+                cmd_str = package.augment_build_command(&cmd_str, binary);
+            }
+
+            let build_err = {
+                let (bin, args) = parse_command(&cmd_str)
+                    .map_err(|_| anyhow::anyhow!("empty build command for target {target}"))?;
+                run_cmd("build", None, bin, &args).err()
+            };
+
+            if let Some(err) = build_err {
+                let err_msg = err.to_string();
+                if using_zigbuild && is_process_fd_quota_exceeded(&err_msg) {
+                    if cross_available {
+                        let fallback = cmd_str.replacen("cargo zigbuild", "cross build", 1);
+                        eprintln!(
+                            "[build] cargo-zigbuild hit file descriptor quota for {target}; retrying with cross"
+                        );
+                        let (bin, args) = parse_command(&fallback)
+                            .map_err(|_| anyhow::anyhow!("empty cross fallback command"))?;
+                        if let Err(retry_err) = run_cmd("build", None, bin, &args) {
+                            eprintln!("[build] Warning: target {target} failed: {retry_err}");
+                            failed.push(target.clone());
+                            continue;
+                        }
+                    } else {
+                        eprintln!(
+                            "[build] Warning: target {target} failed: {err_msg}\n[build] Hint: zig hit the open-file limit. Try `ulimit -n 65536` before running release, or install `cross` to avoid this zig linker path."
+                        );
+                        failed.push(target.clone());
+                        continue;
+                    }
+                } else {
+                    eprintln!("[build] Warning: target {target} failed: {err}");
+                    failed.push(target.clone());
+                    continue;
+                }
             }
 
             let artifact_template = config
@@ -588,13 +878,14 @@ pub fn release(
     preflight(&git, &selected)?;
 
     let version = detect_version(config, version_override)?;
+    let cargo_package = CargoPackageSelection::resolve(config, &selected)?;
     println!(
         "Releasing {} v{version} via: {}",
         config.project.name,
         selected.join(", ")
     );
 
-    let archives = build_artifacts(config, &version)?;
+    let archives = build_artifacts(config, &version, cargo_package.as_ref())?;
 
     // Run git first so other channels can reference release URLs
     let ordered: Vec<&str> = {
@@ -614,7 +905,7 @@ pub fn release(
         match *channel {
             "git" => release_git(config, &git, &version, &archives)?,
             "homebrew" => release_homebrew(config, &git, &version, &archives)?,
-            "cargo" => release_cargo(config)?,
+            "cargo" => release_cargo(config, cargo_package.as_ref())?,
             "curl" => release_curl(config, &git, &version)?,
             "nix" => release_nix(config, &git, &version, &archives)?,
             _ => unreachable!(),
@@ -643,7 +934,17 @@ fn release_upload_url(
     bail!("[{channel}] missing upload_url/id in release response");
 }
 
+fn fetch_release_by_tag(git: &GitContext, repo: &str, version: &str) -> Result<serde_json::Value> {
+    let url = git.repo_api_url(repo, &format!("/releases/tags/v{version}"));
+    git_api(git, "git", "GET", &url, None)
+}
+
 fn create_release(git: &GitContext, repo: &str, version: &str) -> Result<String> {
+    if let Ok(existing) = fetch_release_by_tag(git, repo, version) {
+        eprintln!("[git] Release v{version} already exists; reusing it");
+        return release_upload_url(git, "git", repo, &existing);
+    }
+
     let url = git.repo_api_url(repo, "/releases");
     let body = if git.is_github {
         serde_json::json!({
@@ -657,8 +958,64 @@ fn create_release(git: &GitContext, repo: &str, version: &str) -> Result<String>
             "name": format!("v{version}"),
         })
     };
-    let resp = git_api(git, "git", "POST", &url, Some(&body.to_string()))?;
-    release_upload_url(git, "git", repo, &resp)
+    match git_api(git, "git", "POST", &url, Some(&body.to_string())) {
+        Ok(resp) => release_upload_url(git, "git", repo, &resp),
+        Err(create_err) => {
+            if let Ok(existing) = fetch_release_by_tag(git, repo, version) {
+                eprintln!(
+                    "[git] Reusing existing release v{version} after create returned an error"
+                );
+                return release_upload_url(git, "git", repo, &existing);
+            }
+            Err(create_err)
+        }
+    }
+}
+
+fn delete_existing_asset_if_any(
+    git: &GitContext,
+    repo: &str,
+    version: &str,
+    asset_name: &str,
+) -> Result<()> {
+    let release = match fetch_release_by_tag(git, repo, version) {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+
+    let release_id = release["id"].as_i64();
+    let assets = match release["assets"].as_array() {
+        Some(a) => a,
+        None => return Ok(()),
+    };
+
+    for asset in assets {
+        if asset["name"].as_str() != Some(asset_name) {
+            continue;
+        }
+        let Some(asset_id) = asset["id"].as_i64() else {
+            continue;
+        };
+
+        let delete_url = if git.is_github {
+            git.repo_api_url(repo, &format!("/releases/assets/{asset_id}"))
+        } else if let Some(release_id) = release_id {
+            git.repo_api_url(repo, &format!("/releases/{release_id}/assets/{asset_id}"))
+        } else {
+            eprintln!(
+                "[git] Warning: could not replace existing asset {asset_name}: missing release id"
+            );
+            return Ok(());
+        };
+
+        eprintln!("[git] Removing existing asset {asset_name} before upload");
+        if let Err(err) = git_api(git, "git", "DELETE", &delete_url, None) {
+            eprintln!("[git] Warning: failed to delete existing asset {asset_name}: {err}");
+        }
+        break;
+    }
+
+    Ok(())
 }
 
 fn release_git(
@@ -670,6 +1027,7 @@ fn release_git(
     let upload_url = create_release(git, &config.project.repo, version)?;
     for (_, path) in archives {
         let name = path.file_name().unwrap().to_string_lossy();
+        delete_existing_asset_if_any(git, &config.project.repo, version, &name)?;
         git_upload_asset(git, "git", &upload_url, path, &name, "application/gzip")?;
     }
     println!("[git] Created release v{version}");
@@ -786,10 +1144,19 @@ end
     )
 }
 
-fn release_cargo(config: &Config) -> Result<()> {
+fn release_cargo(config: &Config, cargo_package: Option<&CargoPackageSelection>) -> Result<()> {
     let ch = config.channels.cargo.as_ref().unwrap();
-    let crate_name = ch.crate_name.as_deref().unwrap_or(&config.project.name);
-    run_cmd("cargo", None, "cargo", &["publish"])?;
+    let crate_name = ch
+        .crate_name
+        .as_deref()
+        .or_else(|| cargo_package.map(|package| package.name.as_str()))
+        .unwrap_or(&config.project.name);
+    let mut args = vec!["publish"];
+    if let Some(package) = cargo_package {
+        args.push("--package");
+        args.push(package.name.as_str());
+    }
+    run_cmd("cargo", None, "cargo", &args)?;
     println!("[cargo] Published crate {crate_name}");
     Ok(())
 }
@@ -810,6 +1177,7 @@ fn release_curl(config: &Config, git: &GitContext, version: &str) -> Result<()> 
         anyhow::anyhow!("[curl] could not find release v{version} — is the git channel enabled?")
     })?;
 
+    delete_existing_asset_if_any(git, repo, version, "install.sh")?;
     git_upload_asset(
         git,
         "curl",
@@ -1324,6 +1692,32 @@ mod tests {
         assert!(matches!(plan, CargoBuildPlan::RunAsIs));
     }
 
+    // --- command parsing / linker error tests ---
+
+    #[test]
+    fn parse_command_splits_binary_and_args() {
+        let (bin, args) =
+            parse_command("cargo build --release --target x86_64-unknown-linux-gnu").unwrap();
+        assert_eq!(bin, "cargo");
+        assert_eq!(
+            args,
+            vec!["build", "--release", "--target", "x86_64-unknown-linux-gnu"]
+        );
+    }
+
+    #[test]
+    fn parse_command_rejects_empty_command() {
+        assert!(parse_command("   ").is_err());
+    }
+
+    #[test]
+    fn is_process_fd_quota_exceeded_detects_zig_error() {
+        assert!(is_process_fd_quota_exceeded(
+            "error: unable to search for static library: ProcessFdQuotaExceeded"
+        ));
+        assert!(!is_process_fd_quota_exceeded("some other linker error"));
+    }
+
     // --- parse_installed_targets tests ---
 
     #[test]
@@ -1349,6 +1743,162 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(result.contains("aarch64-apple-darwin"));
         assert!(result.contains("x86_64-apple-darwin"));
+    }
+
+    // --- cargo workspace package detection tests ---
+
+    #[test]
+    fn cargo_workspace_detects_unique_binary_package() {
+        let metadata = r#"
+{
+  "workspace_members": ["path+file:///repo/app-cli#0.1.0", "path+file:///repo/helper#0.1.0"],
+  "packages": [
+    {
+      "id": "path+file:///repo/app-cli#0.1.0",
+      "name": "app-cli",
+      "targets": [
+        { "name": "coolapp", "kind": ["bin"] },
+        { "name": "app_cli", "kind": ["lib"] }
+      ]
+    },
+    {
+      "id": "path+file:///repo/helper#0.1.0",
+      "name": "helper",
+      "targets": [
+        { "name": "helper", "kind": ["bin"] }
+      ]
+    }
+  ]
+}
+"#;
+        let workspace = CargoWorkspace::from_metadata_json(metadata).unwrap();
+        let package = workspace.package_for_binary("coolapp").unwrap().unwrap();
+        assert_eq!(package.name, "app-cli");
+    }
+
+    #[test]
+    fn cargo_workspace_ignores_non_workspace_packages() {
+        let metadata = r#"
+{
+  "workspace_members": ["path+file:///repo/app-cli#0.1.0"],
+  "packages": [
+    {
+      "id": "path+file:///repo/app-cli#0.1.0",
+      "name": "app-cli",
+      "targets": [
+        { "name": "coolapp", "kind": ["bin"] }
+      ]
+    },
+    {
+      "id": "path+file:///repo/dep#0.1.0",
+      "name": "dep",
+      "targets": [
+        { "name": "dep-bin", "kind": ["bin"] }
+      ]
+    }
+  ]
+}
+"#;
+        let workspace = CargoWorkspace::from_metadata_json(metadata).unwrap();
+        assert!(workspace.package_for_binary("dep-bin").unwrap().is_none());
+    }
+
+    #[test]
+    fn cargo_workspace_rejects_ambiguous_binary_package() {
+        let metadata = r#"
+{
+  "workspace_members": ["path+file:///repo/one#0.1.0", "path+file:///repo/two#0.1.0"],
+  "packages": [
+    {
+      "id": "path+file:///repo/one#0.1.0",
+      "name": "one",
+      "targets": [{ "name": "tool", "kind": ["bin"] }]
+    },
+    {
+      "id": "path+file:///repo/two#0.1.0",
+      "name": "two",
+      "targets": [{ "name": "tool", "kind": ["bin"] }]
+    }
+  ]
+}
+"#;
+        let workspace = CargoWorkspace::from_metadata_json(metadata).unwrap();
+        let err = workspace.package_for_binary("tool").unwrap_err();
+        assert!(err.to_string().contains("multiple workspace packages"));
+        assert!(err.to_string().contains("project.package"));
+    }
+
+    #[test]
+    fn cargo_package_selection_uses_project_package_override() {
+        let config = Config::parse(
+            r#"
+[project]
+name = "coolapp"
+package = "app-cli"
+repo = "owner/repo"
+
+[build]
+command = "make"
+artifact = "out/{binary}"
+targets = ["x86_64-apple-darwin"]
+"#,
+        )
+        .unwrap();
+        let package = CargoPackageSelection::resolve(&config, &["cargo"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(package.name, "app-cli");
+    }
+
+    #[test]
+    fn cargo_package_selection_augments_cargo_build() {
+        let package = CargoPackageSelection {
+            name: "app-cli".to_string(),
+        };
+        let command = package.augment_build_command(
+            "cargo build --release --target x86_64-unknown-linux-gnu",
+            "coolapp",
+        );
+        assert_eq!(
+            command,
+            "cargo build --release --target x86_64-unknown-linux-gnu --package app-cli --bin coolapp"
+        );
+    }
+
+    #[test]
+    fn cargo_package_selection_augments_cross_build() {
+        let package = CargoPackageSelection {
+            name: "app-cli".to_string(),
+        };
+        let command = package.augment_build_command("cross build --release", "coolapp");
+        assert_eq!(
+            command,
+            "cross build --release --package app-cli --bin coolapp"
+        );
+    }
+
+    #[test]
+    fn cargo_package_selection_does_not_duplicate_selectors() {
+        let package = CargoPackageSelection {
+            name: "app-cli".to_string(),
+        };
+        let command = package.augment_build_command(
+            "cargo build --package app-cli --bin coolapp --release",
+            "coolapp",
+        );
+        assert_eq!(
+            command,
+            "cargo build --package app-cli --bin coolapp --release"
+        );
+    }
+
+    #[test]
+    fn cargo_package_selection_ignores_non_cargo_commands() {
+        let package = CargoPackageSelection {
+            name: "app-cli".to_string(),
+        };
+        let command = package.augment_build_command("make release", "coolapp");
+        assert_eq!(command, "make release");
     }
 
     // --- generate_install_script tests ---

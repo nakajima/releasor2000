@@ -69,7 +69,8 @@ Use `releasor2000 validate` to check your config without releasing.
 ```toml
 [project]
 name = "myapp"
-# binary = "myapp"  # defaults to project name
+# binary = "myapp"   # defaults to project name
+# package = "myapp"  # optional workspace package override; auto-detected from binary when unique
 repo = "owner/myapp"
 # version_command = "git describe --tags --abbrev=0"
 
@@ -111,6 +112,7 @@ enabled = true
 |---|---|---|
 | `name` | yes | Project name |
 | `binary` | no | Binary name (defaults to `name`) |
+| `package` | no | Cargo workspace package override (auto-detected from `binary` when unique) |
 | `repo` | yes | Repository path (`owner/repo`) |
 | `version_command` | no | Shell command to detect version (defaults to `git describe --tags --abbrev=0`) |
 
@@ -127,7 +129,7 @@ enabled = true
 
 | Field | Required | Description |
 |---|---|---|
-| `command` | yes* | Build command template. Supports `{target}`, `{binary}`, `{version}` placeholders |
+| `command` | yes* | Build command template. Supports `{target}`, `{binary}`, `{package}`, `{version}` placeholders |
 | `artifact` | yes* | Path to built artifact. Same placeholders as `command` |
 | `pre_built_dir` | yes* | Directory with pre-built binaries (mutually exclusive with `command`) |
 | `targets` | yes | List of Rust target triples to build for |
@@ -172,6 +174,8 @@ crate_name = "myapp"  # defaults to project name
 ```
 
 Requires prior `cargo login`.
+
+In Cargo workspaces, releasor2000 auto-detects the package when exactly one workspace member provides the configured binary target. Set `[project].package` if the binary name is ambiguous.
 
 ### Curl
 
