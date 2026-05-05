@@ -128,7 +128,7 @@ Underscore config keys are still accepted for compatibility, but they are deprec
 | `version-command` | no | Shell command to detect version (defaults to `git describe --tags --abbrev=0`) |
 
 If `binaries` is set, releasor2000 builds/packages each `{binary}` per target and uploads each archive as its own release asset. If both `binary` and `binaries` are set, `binary` must be included in `binaries`.
-When `auto-tag = true`, releasor2000 currently supports Rust projects (`Cargo.toml` with `[package].version`) and fails if tag `v<version>` already exists locally or on `origin`.
+When `auto-tag = true`, releasor2000 supports Rust packages and Cargo workspace roots. In workspaces, it uses the same binary-to-package detection as release builds, or `[project].package` if set. It fails if tag `v<version>` already exists locally or on `origin`.
 
 ### Git fields
 
