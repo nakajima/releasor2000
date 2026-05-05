@@ -184,37 +184,90 @@ fn detect_project_kind() -> Result<ProjectKind> {
     )
 }
 
-fn rust_manifest_version(manifest_path: &Path) -> Result<String> {
+fn rust_manifest_package_version(manifest_path: &Path) -> Result<Option<String>> {
     let manifest = std::fs::read_to_string(manifest_path)
         .with_context(|| format!("failed reading {}", manifest_path.display()))?;
     let parsed: TomlValue = toml::from_str(&manifest)
         .with_context(|| format!("failed parsing {}", manifest_path.display()))?;
-    let package = parsed
+    let version = parsed
         .get("package")
         .and_then(TomlValue::as_table)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} is missing [package]; workspace roots without package.version are not supported by auto-tag. Pass --version or disable project.auto-tag for now.",
-                manifest_path.display()
-            )
-        })?;
-    let version = package
-        .get("version")
+        .and_then(|package| package.get("version"))
         .and_then(TomlValue::as_str)
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} is missing package.version; workspace roots without package.version are not supported by auto-tag. Pass --version or disable project.auto-tag for now.",
-                manifest_path.display()
-            )
-        })?;
-    Ok(version.to_string())
+        .map(str::to_string);
+    Ok(version)
 }
 
-fn detect_manifest_version() -> Result<String> {
+#[cfg(test)]
+fn rust_manifest_version(manifest_path: &Path) -> Result<String> {
+    rust_manifest_package_version(manifest_path)?
+        .ok_or_else(|| anyhow::anyhow!("{} is missing package.version", manifest_path.display()))
+}
+
+fn rust_workspace_package_version(
+    config: &Config,
+    cargo_package: Option<&CargoPackageSelection>,
+    workspace: &CargoWorkspace,
+) -> Result<Option<String>> {
+    if let Some(package) = cargo_package {
+        return workspace
+            .version_for_package(&package.name)?
+            .map(Some)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "project.package {} was not found in cargo workspace",
+                    package.name
+                )
+            });
+    }
+
+    let binary = config.project.primary_binary();
+    if let Some(package) = workspace.package_for_binary(binary)? {
+        return workspace.version_for_package(&package.name);
+    }
+
+    if workspace.packages.len() == 1 {
+        return Ok(Some(workspace.packages[0].version.clone()));
+    }
+
+    Ok(None)
+}
+
+fn detect_manifest_version(
+    config: &Config,
+    cargo_package: Option<&CargoPackageSelection>,
+) -> Result<String> {
     match detect_project_kind()? {
-        ProjectKind::Rust => rust_manifest_version(Path::new("Cargo.toml")),
+        ProjectKind::Rust => {
+            if cargo_package.is_some() {
+                let workspace =
+                    CargoWorkspace::load().context("detecting Cargo workspace package version")?;
+                if let Some(version) =
+                    rust_workspace_package_version(config, cargo_package, &workspace)?
+                {
+                    return Ok(version);
+                }
+            }
+
+            if let Some(version) = rust_manifest_package_version(Path::new("Cargo.toml"))? {
+                return Ok(version);
+            }
+
+            let workspace =
+                CargoWorkspace::load().context("detecting Cargo workspace package version")?;
+            if let Some(version) =
+                rust_workspace_package_version(config, cargo_package, &workspace)?
+            {
+                return Ok(version);
+            }
+
+            let binary = config.project.primary_binary();
+            bail!(
+                "Cargo.toml is a workspace root without package.version, and no workspace package provides binary {binary}; set project.package or disable project.auto-tag"
+            )
+        }
     }
 }
 
@@ -346,6 +399,7 @@ struct CargoPackageSelection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CargoWorkspacePackage {
     name: String,
+    version: String,
     binary_targets: Vec<String>,
 }
 
@@ -392,6 +446,9 @@ impl CargoWorkspace {
             let Some(name) = package["name"].as_str() else {
                 continue;
             };
+            let Some(version) = package["version"].as_str() else {
+                continue;
+            };
 
             let mut binary_targets = Vec::new();
             if let Some(targets) = package["targets"].as_array() {
@@ -413,6 +470,7 @@ impl CargoWorkspace {
 
             workspace_packages.push(CargoWorkspacePackage {
                 name: name.to_string(),
+                version: version.to_string(),
                 binary_targets,
             });
         }
@@ -438,6 +496,23 @@ impl CargoWorkspace {
             names => bail!(
                 "could not infer cargo package: binary {binary} is provided by multiple workspace packages ({}); set project.package",
                 names.join(", ")
+            ),
+        }
+    }
+
+    fn version_for_package(&self, package_name: &str) -> Result<Option<String>> {
+        let matches: Vec<&CargoWorkspacePackage> = self
+            .packages
+            .iter()
+            .filter(|package| package.name == package_name)
+            .collect();
+
+        match matches.as_slice() {
+            [] => Ok(None),
+            [package] => Ok(Some(package.version.clone())),
+            packages => bail!(
+                "could not infer cargo package version: multiple workspace packages are named {package_name} ({})",
+                packages.len()
             ),
         }
     }
@@ -1016,9 +1091,10 @@ pub fn release(
 
     let auto_tag_enabled = config.project.auto_tag && selected.contains(&"git");
     preflight(&git, &selected, auto_tag_enabled)?;
+    let cargo_package = CargoPackageSelection::resolve(config, &selected)?;
 
     let version = if auto_tag_enabled {
-        let manifest_version = detect_manifest_version()?;
+        let manifest_version = detect_manifest_version(config, cargo_package.as_ref())?;
         if let Some(override_version) = version_override {
             let normalized_override = normalize_version(override_version);
             if normalized_override != manifest_version {
@@ -1037,7 +1113,6 @@ pub fn release(
         create_and_push_tag(&version)?;
     }
 
-    let cargo_package = CargoPackageSelection::resolve(config, &selected)?;
     println!(
         "Releasing {} v{version} via: {}",
         config.project.name,
@@ -1831,8 +1906,7 @@ members = ["app"]
         );
         let err = rust_manifest_version(&path).unwrap_err();
         assert!(
-            err.to_string()
-                .contains("workspace roots without package.version are not supported"),
+            err.to_string().contains("missing package.version"),
             "got: {err}"
         );
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
@@ -2002,6 +2076,7 @@ members = ["app"]
     {
       "id": "path+file:///repo/app-cli#0.1.0",
       "name": "app-cli",
+      "version": "0.1.0",
       "targets": [
         { "name": "coolapp", "kind": ["bin"] },
         { "name": "app_cli", "kind": ["lib"] }
@@ -2010,6 +2085,7 @@ members = ["app"]
     {
       "id": "path+file:///repo/helper#0.1.0",
       "name": "helper",
+      "version": "0.1.0",
       "targets": [
         { "name": "helper", "kind": ["bin"] }
       ]
@@ -2020,6 +2096,84 @@ members = ["app"]
         let workspace = CargoWorkspace::from_metadata_json(metadata).unwrap();
         let package = workspace.package_for_binary("coolapp").unwrap().unwrap();
         assert_eq!(package.name, "app-cli");
+        assert_eq!(
+            workspace.version_for_package("app-cli").unwrap(),
+            Some("0.1.0".to_string())
+        );
+    }
+
+    #[test]
+    fn rust_workspace_package_version_uses_detected_binary_package() {
+        let config = Config::parse(
+            r#"
+[project]
+name = "coolapp"
+repo = "owner/repo"
+
+[build]
+command = "cargo build --release --target {target}"
+artifact = "target/{target}/release/{binary}"
+targets = ["x86_64-apple-darwin"]
+"#,
+        )
+        .unwrap();
+        let metadata = r#"
+{
+  "workspace_members": ["path+file:///repo/app-cli#1.2.3"],
+  "packages": [
+    {
+      "id": "path+file:///repo/app-cli#1.2.3",
+      "name": "app-cli",
+      "version": "1.2.3",
+      "targets": [{ "name": "coolapp", "kind": ["bin"] }]
+    }
+  ]
+}
+"#;
+        let workspace = CargoWorkspace::from_metadata_json(metadata).unwrap();
+        let version = rust_workspace_package_version(&config, None, &workspace)
+            .unwrap()
+            .unwrap();
+        assert_eq!(version, "1.2.3");
+    }
+
+    #[test]
+    fn rust_workspace_package_version_uses_project_package_override() {
+        let config = Config::parse(
+            r#"
+[project]
+name = "coolapp"
+package = "app-cli"
+repo = "owner/repo"
+
+[build]
+command = "make"
+artifact = "out/{binary}"
+targets = ["x86_64-apple-darwin"]
+"#,
+        )
+        .unwrap();
+        let package = CargoPackageSelection {
+            name: "app-cli".to_string(),
+        };
+        let metadata = r#"
+{
+  "workspace_members": ["path+file:///repo/app-cli#2.3.4"],
+  "packages": [
+    {
+      "id": "path+file:///repo/app-cli#2.3.4",
+      "name": "app-cli",
+      "version": "2.3.4",
+      "targets": [{ "name": "other-bin", "kind": ["bin"] }]
+    }
+  ]
+}
+"#;
+        let workspace = CargoWorkspace::from_metadata_json(metadata).unwrap();
+        let version = rust_workspace_package_version(&config, Some(&package), &workspace)
+            .unwrap()
+            .unwrap();
+        assert_eq!(version, "2.3.4");
     }
 
     #[test]
@@ -2031,6 +2185,7 @@ members = ["app"]
     {
       "id": "path+file:///repo/app-cli#0.1.0",
       "name": "app-cli",
+      "version": "0.1.0",
       "targets": [
         { "name": "coolapp", "kind": ["bin"] }
       ]
@@ -2038,6 +2193,7 @@ members = ["app"]
     {
       "id": "path+file:///repo/dep#0.1.0",
       "name": "dep",
+      "version": "0.1.0",
       "targets": [
         { "name": "dep-bin", "kind": ["bin"] }
       ]
@@ -2058,11 +2214,13 @@ members = ["app"]
     {
       "id": "path+file:///repo/one#0.1.0",
       "name": "one",
+      "version": "0.1.0",
       "targets": [{ "name": "tool", "kind": ["bin"] }]
     },
     {
       "id": "path+file:///repo/two#0.1.0",
       "name": "two",
+      "version": "0.1.0",
       "targets": [{ "name": "tool", "kind": ["bin"] }]
     }
   ]
