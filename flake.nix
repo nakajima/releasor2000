@@ -9,10 +9,10 @@
         pkgs = nixpkgs.legacyPackages.x86_64-darwin;
         pkg = pkgs.stdenv.mkDerivation {
           pname = "releasor2000";
-          version = "0.1.5";
+          version = "0.1.7";
           src = pkgs.fetchurl {
-            url = "https://github.com/nakajima/releasor2000/releases/download/v0.1.5/releasor2000-0.1.5-x86_64-apple-darwin.tar.gz";
-            sha256 = "69e1ef7be01565df9999d22df5a8550ec0e28fc3761841198a0968f79778856a";
+            url = "https://github.com/nakajima/releasor2000/releases/download/v0.1.7/releasor2000-0.1.7-x86_64-apple-darwin.tar.gz";
+            sha256 = "6d59c655ee61517d4906abe20a93fcc650d2abc057df50bb2cf5cf8be116c212";
           };
           sourceRoot = ".";
           installPhase = ''
@@ -24,10 +24,10 @@
         pkgs = nixpkgs.legacyPackages.aarch64-darwin;
         pkg = pkgs.stdenv.mkDerivation {
           pname = "releasor2000";
-          version = "0.1.5";
+          version = "0.1.7";
           src = pkgs.fetchurl {
-            url = "https://github.com/nakajima/releasor2000/releases/download/v0.1.5/releasor2000-0.1.5-aarch64-apple-darwin.tar.gz";
-            sha256 = "916abe2a33d8bf69ee75b2b4d3cabec3706dfb32382e05d2c47f657d8d4989a5";
+            url = "https://github.com/nakajima/releasor2000/releases/download/v0.1.7/releasor2000-0.1.7-aarch64-apple-darwin.tar.gz";
+            sha256 = "940ed82839c5e8431de01c73a47ff1176dcd412f9dd75164f1f41b442576d880";
           };
           sourceRoot = ".";
           installPhase = ''
@@ -39,10 +39,10 @@
         pkgs = nixpkgs.legacyPackages.x86_64-linux;
         pkg = pkgs.stdenv.mkDerivation {
           pname = "releasor2000";
-          version = "0.1.5";
+          version = "0.1.7";
           src = pkgs.fetchurl {
-            url = "https://github.com/nakajima/releasor2000/releases/download/v0.1.5/releasor2000-0.1.5-x86_64-unknown-linux-gnu.tar.gz";
-            sha256 = "a569b2961cc2eddaef3f4cb60d32cad0c8e6dd0f16334ae99d10bd9c48344cc3";
+            url = "https://github.com/nakajima/releasor2000/releases/download/v0.1.7/releasor2000-0.1.7-x86_64-unknown-linux-gnu.tar.gz";
+            sha256 = "501d2948067c0d9adfa14b820e5e5e8aec095b37850dfd6756628f50da0ba7d5";
           };
           sourceRoot = ".";
           installPhase = ''
@@ -54,10 +54,10 @@
         pkgs = nixpkgs.legacyPackages.aarch64-linux;
         pkg = pkgs.stdenv.mkDerivation {
           pname = "releasor2000";
-          version = "0.1.5";
+          version = "0.1.7";
           src = pkgs.fetchurl {
-            url = "https://github.com/nakajima/releasor2000/releases/download/v0.1.5/releasor2000-0.1.5-aarch64-unknown-linux-gnu.tar.gz";
-            sha256 = "87e787f2bfc01440e99e283dc8ea37ecb004f08853a003cf25fe71ab4b2b7598";
+            url = "https://github.com/nakajima/releasor2000/releases/download/v0.1.7/releasor2000-0.1.7-aarch64-unknown-linux-gnu.tar.gz";
+            sha256 = "0f1d3d1284aeca25c5b0a469e3f0706af516327f072123f9a91340242140ab5a";
           };
           sourceRoot = ".";
           installPhase = ''
