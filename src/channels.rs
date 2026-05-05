@@ -3,6 +3,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use toml::Value as TomlValue;
 
 use crate::config::{Config, GitType};
 
@@ -165,21 +166,121 @@ fn substitute(template: &str, vars: &[(&str, &str)]) -> String {
     result
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectKind {
+    Rust,
+}
+
+fn normalize_version(v: &str) -> String {
+    v.strip_prefix('v').unwrap_or(v).trim().to_string()
+}
+
+fn detect_project_kind() -> Result<ProjectKind> {
+    if Path::new("Cargo.toml").exists() {
+        return Ok(ProjectKind::Rust);
+    }
+    bail!(
+        "auto-tag is enabled, but no supported manifest was found in the current directory (expected Cargo.toml for Rust projects)"
+    )
+}
+
+fn rust_manifest_version(manifest_path: &Path) -> Result<String> {
+    let manifest = std::fs::read_to_string(manifest_path)
+        .with_context(|| format!("failed reading {}", manifest_path.display()))?;
+    let parsed: TomlValue = toml::from_str(&manifest)
+        .with_context(|| format!("failed parsing {}", manifest_path.display()))?;
+    let package = parsed
+        .get("package")
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} is missing [package]; workspace roots without package.version are not supported by auto-tag. Pass --version or disable project.auto-tag for now.",
+                manifest_path.display()
+            )
+        })?;
+    let version = package
+        .get("version")
+        .and_then(TomlValue::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} is missing package.version; workspace roots without package.version are not supported by auto-tag. Pass --version or disable project.auto-tag for now.",
+                manifest_path.display()
+            )
+        })?;
+    Ok(version.to_string())
+}
+
+fn detect_manifest_version() -> Result<String> {
+    match detect_project_kind()? {
+        ProjectKind::Rust => rust_manifest_version(Path::new("Cargo.toml")),
+    }
+}
+
+fn local_tag_exists(tag: &str) -> Result<bool> {
+    let ref_name = format!("refs/tags/{tag}");
+    let output = Command::new("git")
+        .args(["rev-parse", "-q", "--verify", &ref_name])
+        .output()
+        .context("[tag] failed to run git rev-parse")?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!("[tag] could not check local tag {tag}: {stderr}");
+}
+
+fn remote_tag_exists(tag: &str) -> Result<bool> {
+    let ref_name = format!("refs/tags/{tag}");
+    let output = Command::new("git")
+        .args(["ls-remote", "--exit-code", "--tags", "origin", &ref_name])
+        .output()
+        .context("[tag] failed to run git ls-remote")?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if output.status.code() == Some(2) {
+        return Ok(false);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!("[tag] could not check remote tag {tag} on origin: {stderr}");
+}
+
+fn create_and_push_tag(version: &str) -> Result<()> {
+    let tag = format!("v{version}");
+    if local_tag_exists(&tag)? {
+        bail!("[tag] tag {tag} already exists locally");
+    }
+    if remote_tag_exists(&tag)? {
+        bail!("[tag] tag {tag} already exists on origin");
+    }
+
+    let message = format!("Release {tag}");
+    run_cmd("tag", None, "git", &["tag", "-a", &tag, "-m", &message])?;
+    run_cmd("tag", None, "git", &["push", "origin", &tag])?;
+    println!("[tag] Created and pushed {tag}");
+    Ok(())
+}
+
 fn detect_version(config: &Config, version_override: Option<&str>) -> Result<String> {
     if let Some(v) = version_override {
-        return Ok(v.strip_prefix('v').unwrap_or(v).to_string());
+        return Ok(normalize_version(v));
     }
     let raw = if let Some(cmd) = &config.project.version_command {
         let parts: Vec<&str> = cmd.split_whitespace().collect();
         let (bin, args) = parts
             .split_first()
-            .ok_or_else(|| anyhow::anyhow!("empty version_command"))?;
-        run_cmd("version", None, bin, args).context("version_command failed")?
+            .ok_or_else(|| anyhow::anyhow!("empty version-command"))?;
+        run_cmd("version", None, bin, args).context("version-command failed")?
     } else {
         run_cmd("version", None, "git", &["describe", "--tags", "--abbrev=0"])
-            .context("could not detect version from git tags — use --version or set version_command in config")?
+            .context("could not detect version from git tags — use --version or set version-command in config")?
     };
-    Ok(raw.strip_prefix('v').unwrap_or(&raw).to_string())
+    Ok(normalize_version(&raw))
 }
 
 fn confirm(prompt: &str) -> Result<bool> {
@@ -370,7 +471,7 @@ impl CargoPackageSelection {
             }
         };
 
-        let binary = config.project.binary();
+        let binary = config.project.primary_binary();
         if let Some(package) = workspace.package_for_binary(binary)? {
             return Ok(Some(package));
         }
@@ -548,12 +649,20 @@ fn installed_targets() -> HashSet<String> {
         .unwrap_or_default()
 }
 
+#[derive(Debug, Clone)]
+struct BuiltArchive {
+    binary: String,
+    target: String,
+    asset_name: String,
+    archive_path: PathBuf,
+}
+
 fn build_artifacts(
     config: &Config,
     version: &str,
     cargo_package: Option<&CargoPackageSelection>,
-) -> Result<Vec<(String, PathBuf)>> {
-    let binary = config.project.binary();
+) -> Result<Vec<BuiltArchive>> {
+    let binaries = config.project.release_binaries();
     let staging = PathBuf::from("target/release-staging");
     std::fs::create_dir_all(&staging)?;
 
@@ -562,152 +671,165 @@ fn build_artifacts(
     let cross_available = has_cross();
 
     let mut archives = Vec::new();
-    let mut failed = Vec::new();
+    let mut failed_pairs: Vec<(String, String)> = Vec::new();
+    let total_attempts = config.build.targets.len() * binaries.len();
+
     for target in &config.build.targets {
-        let package = cargo_package
-            .map(|package| package.name.as_str())
-            .unwrap_or("");
-        let vars = &[
-            ("target", target.as_str()),
-            ("binary", binary),
-            ("package", package),
-            ("version", version),
-        ];
+        for binary in &binaries {
+            let binary = *binary;
+            let package = cargo_package
+                .map(|package| package.name.as_str())
+                .unwrap_or("");
+            let vars = &[
+                ("target", target.as_str()),
+                ("binary", binary),
+                ("package", package),
+                ("version", version),
+            ];
 
-        let artifact_path = if let Some(cmd_template) = &config.build.command {
-            let mut cmd_str = substitute(cmd_template, vars);
-            let cross_needed = needs_cross_linker(&host, target);
-            let mut using_zigbuild = false;
+            let artifact_path = if let Some(cmd_template) = &config.build.command {
+                let mut cmd_str = substitute(cmd_template, vars);
+                let cross_needed = needs_cross_linker(&host, target);
+                let mut using_zigbuild = false;
 
-            if cmd_str.contains("cargo build") {
-                match plan_cargo_build(&host, target, zigbuild_available, cross_available) {
-                    CargoBuildPlan::RunAsIs => {
-                        if cross_needed {
+                if cmd_str.contains("cargo build") {
+                    match plan_cargo_build(&host, target, zigbuild_available, cross_available) {
+                        CargoBuildPlan::RunAsIs => {
+                            if cross_needed {
+                                eprintln!(
+                                    "[build] No cross helper detected for {target}; trying plain cargo build (set {} if linker errors occur)",
+                                    linker_env_var(target)
+                                );
+                            }
+                        }
+                        CargoBuildPlan::ReplaceCommand {
+                            replacement,
+                            tool_name,
+                        } => {
                             eprintln!(
-                                "[build] No cross helper detected for {target}; trying plain cargo build (set {} if linker errors occur)",
-                                linker_env_var(target)
+                                "[build] Using {tool_name} for cross-compilation target {target}"
                             );
+                            cmd_str = cmd_str.replacen("cargo build", replacement, 1);
+                            using_zigbuild = tool_name == "cargo-zigbuild";
+                        }
+                        CargoBuildPlan::Skip(reason) => {
+                            eprintln!("[build] Warning: {binary} ({target}) skipped: {reason}");
+                            failed_pairs.push((binary.to_string(), target.clone()));
+                            continue;
                         }
                     }
-                    CargoBuildPlan::ReplaceCommand {
-                        replacement,
-                        tool_name,
-                    } => {
-                        eprintln!(
-                            "[build] Using {tool_name} for cross-compilation target {target}"
-                        );
-                        cmd_str = cmd_str.replacen("cargo build", replacement, 1);
-                        using_zigbuild = tool_name == "cargo-zigbuild";
-                    }
-                    CargoBuildPlan::Skip(reason) => {
-                        eprintln!("[build] Warning: target {target} skipped: {reason}");
-                        failed.push(target.clone());
-                        continue;
-                    }
                 }
-            }
 
-            if let Some(package) = cargo_package {
-                cmd_str = package.augment_build_command(&cmd_str, binary);
-            }
+                if let Some(package) = cargo_package {
+                    cmd_str = package.augment_build_command(&cmd_str, binary);
+                }
 
-            let build_err = {
-                let (bin, args) = parse_command(&cmd_str)
-                    .map_err(|_| anyhow::anyhow!("empty build command for target {target}"))?;
-                run_cmd("build", None, bin, &args).err()
-            };
+                let build_err = {
+                    let (bin, args) = parse_command(&cmd_str).map_err(|_| {
+                        anyhow::anyhow!("empty build command for {binary} ({target})")
+                    })?;
+                    run_cmd("build", None, bin, &args).err()
+                };
 
-            if let Some(err) = build_err {
-                let err_msg = err.to_string();
-                if using_zigbuild && is_process_fd_quota_exceeded(&err_msg) {
-                    if cross_available {
-                        let fallback = cmd_str.replacen("cargo zigbuild", "cross build", 1);
-                        eprintln!(
-                            "[build] cargo-zigbuild hit file descriptor quota for {target}; retrying with cross"
-                        );
-                        let (bin, args) = parse_command(&fallback)
-                            .map_err(|_| anyhow::anyhow!("empty cross fallback command"))?;
-                        if let Err(retry_err) = run_cmd("build", None, bin, &args) {
-                            eprintln!("[build] Warning: target {target} failed: {retry_err}");
-                            failed.push(target.clone());
+                if let Some(err) = build_err {
+                    let err_msg = err.to_string();
+                    if using_zigbuild && is_process_fd_quota_exceeded(&err_msg) {
+                        if cross_available {
+                            let fallback = cmd_str.replacen("cargo zigbuild", "cross build", 1);
+                            eprintln!(
+                                "[build] cargo-zigbuild hit file descriptor quota for {binary} ({target}); retrying with cross"
+                            );
+                            let (bin, args) = parse_command(&fallback)
+                                .map_err(|_| anyhow::anyhow!("empty cross fallback command"))?;
+                            if let Err(retry_err) = run_cmd("build", None, bin, &args) {
+                                eprintln!(
+                                    "[build] Warning: {binary} ({target}) failed: {retry_err}"
+                                );
+                                failed_pairs.push((binary.to_string(), target.clone()));
+                                continue;
+                            }
+                        } else {
+                            eprintln!(
+                                "[build] Warning: {binary} ({target}) failed: {err_msg}\n[build] Hint: zig hit the open-file limit. Try `ulimit -n 65536` before running release, or install `cross` to avoid this zig linker path."
+                            );
+                            failed_pairs.push((binary.to_string(), target.clone()));
                             continue;
                         }
                     } else {
-                        eprintln!(
-                            "[build] Warning: target {target} failed: {err_msg}\n[build] Hint: zig hit the open-file limit. Try `ulimit -n 65536` before running release, or install `cross` to avoid this zig linker path."
-                        );
-                        failed.push(target.clone());
+                        eprintln!("[build] Warning: {binary} ({target}) failed: {err}");
+                        failed_pairs.push((binary.to_string(), target.clone()));
                         continue;
                     }
-                } else {
-                    eprintln!("[build] Warning: target {target} failed: {err}");
-                    failed.push(target.clone());
-                    continue;
                 }
+
+                let artifact_template = config
+                    .build
+                    .artifact
+                    .as_ref()
+                    .expect("artifact required with command");
+                PathBuf::from(substitute(artifact_template, vars))
+            } else {
+                let dir = config
+                    .build
+                    .pre_built_dir
+                    .as_ref()
+                    .expect("pre_built_dir required");
+                PathBuf::from(substitute(dir, vars)).join(format!("{binary}-{target}"))
+            };
+
+            if !artifact_path.exists() {
+                eprintln!(
+                    "[build] Warning: {binary} ({target}) failed: artifact not found at {}",
+                    artifact_path.display()
+                );
+                failed_pairs.push((binary.to_string(), target.clone()));
+                continue;
             }
 
-            let artifact_template = config
-                .build
-                .artifact
-                .as_ref()
-                .expect("artifact required with command");
-            PathBuf::from(substitute(artifact_template, vars))
-        } else {
-            let dir = config
-                .build
-                .pre_built_dir
-                .as_ref()
-                .expect("pre_built_dir required");
-            PathBuf::from(substitute(dir, vars)).join(format!("{binary}-{target}"))
-        };
+            let archive_name = format!("{binary}-{version}-{target}.tar.gz");
+            let archive_path = staging.join(&archive_name);
 
-        if !artifact_path.exists() {
-            eprintln!(
-                "[build] Warning: target {target} failed: artifact not found at {}",
-                artifact_path.display()
-            );
-            failed.push(target.clone());
-            continue;
+            let artifact_dir = artifact_path.parent().unwrap_or_else(|| Path::new("."));
+            let artifact_file = artifact_path
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("artifact has no filename"))?
+                .to_string_lossy();
+
+            run_cmd(
+                "build",
+                Some(artifact_dir),
+                "tar",
+                &[
+                    "czf",
+                    &archive_path
+                        .canonicalize()
+                        .unwrap_or(std::fs::canonicalize(&staging)?.join(&archive_name))
+                        .to_string_lossy(),
+                    &artifact_file,
+                ],
+            )?;
+
+            archives.push(BuiltArchive {
+                binary: binary.to_string(),
+                target: target.clone(),
+                asset_name: archive_name,
+                archive_path,
+            });
         }
-
-        let archive_name = format!("{binary}-{version}-{target}.tar.gz");
-        let archive_path = staging.join(&archive_name);
-
-        let artifact_dir = artifact_path.parent().unwrap_or_else(|| Path::new("."));
-        let artifact_file = artifact_path
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("artifact has no filename"))?
-            .to_string_lossy();
-
-        run_cmd(
-            "build",
-            Some(artifact_dir),
-            "tar",
-            &[
-                "czf",
-                &archive_path
-                    .canonicalize()
-                    .unwrap_or(std::fs::canonicalize(&staging)?.join(&archive_name))
-                    .to_string_lossy(),
-                &artifact_file,
-            ],
-        )?;
-
-        archives.push((target.clone(), archive_path));
     }
 
     if archives.is_empty() {
-        bail!("all build targets failed");
+        bail!("all build target/binary combinations failed");
     }
 
-    if !failed.is_empty() {
+    if !failed_pairs.is_empty() {
         eprintln!(
-            "\n{}/{} targets failed:",
-            failed.len(),
-            config.build.targets.len()
+            "\n{}/{} target/binary combinations failed:",
+            failed_pairs.len(),
+            total_attempts
         );
-        for t in &failed {
-            eprintln!("  - {t}");
+        for (binary, target) in &failed_pairs {
+            eprintln!("  - {binary} ({target})");
         }
         if config
             .build
@@ -716,33 +838,43 @@ fn build_artifacts(
             .is_some_and(|c| c.contains("cargo"))
         {
             let installed = installed_targets();
-            let (installed_failed, missing): (Vec<_>, Vec<_>) =
-                failed.iter().partition(|t| installed.contains(t.as_str()));
+            let mut failed_targets = Vec::new();
+            for (_, target) in &failed_pairs {
+                if !failed_targets.contains(target) {
+                    failed_targets.push(target.clone());
+                }
+            }
+            let (installed_failed, missing): (Vec<_>, Vec<_>) = failed_targets
+                .into_iter()
+                .partition(|target| installed.contains(target.as_str()));
 
             if !missing.is_empty() {
                 eprintln!("\nMissing targets (install with rustup):");
-                for t in &missing {
-                    eprintln!("  rustup target add {t}");
+                for target in &missing {
+                    eprintln!("  rustup target add {target}");
                 }
             }
             if !installed_failed.is_empty() {
                 eprintln!(
                     "\nInstalled but failed to build (missing cross-compilation linker/SDK):"
                 );
-                for t in &installed_failed {
-                    eprintln!("  - {t}");
+                for target in &installed_failed {
+                    eprintln!("  - {target}");
                 }
                 eprintln!(
                     "  Tip: install `cross` (uses Docker) or `cargo-zigbuild` (uses zig) for cross-compilation"
                 );
                 eprintln!("  Or configure a target linker, for example:");
-                for t in installed_failed.iter().take(3) {
-                    eprintln!("    export {}=<path-to-linker>", linker_env_var(t));
+                for target in installed_failed.iter().take(3) {
+                    eprintln!("    export {}=<path-to-linker>", linker_env_var(target));
                 }
                 if installed_failed.len() > 3 {
                     eprintln!("    ...");
                 }
-                if installed_failed.iter().any(|t| t.contains("apple-darwin")) {
+                if installed_failed
+                    .iter()
+                    .any(|target| target.contains("apple-darwin"))
+                {
                     eprintln!("  Note: Apple targets usually require building on macOS.");
                 }
             }
@@ -750,12 +882,15 @@ fn build_artifacts(
         if config.build.pre_built_dir.is_some() {
             let dir = config.build.pre_built_dir.as_ref().unwrap();
             eprintln!("\nExpected pre-built artifacts in {dir}:");
-            for t in &failed {
-                eprintln!("  {dir}{binary}-{t}");
+            for (binary, target) in &failed_pairs {
+                eprintln!("  {dir}{binary}-{target}");
             }
         }
         eprintln!();
-        let succeeded: Vec<&str> = archives.iter().map(|(t, _)| t.as_str()).collect();
+        let succeeded: Vec<String> = archives
+            .iter()
+            .map(|archive| format!("{} ({})", archive.binary, archive.target))
+            .collect();
         eprintln!("Succeeded: {}", succeeded.join(", "));
         if !confirm("Continue with successful targets?")? {
             bail!("aborted by user");
@@ -799,7 +934,7 @@ fn command_exists(cmd: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-fn preflight(git: &GitContext, selected: &[&str]) -> Result<()> {
+fn preflight(git: &GitContext, selected: &[&str], auto_tag_enabled: bool) -> Result<()> {
     let mut missing = Vec::new();
 
     let needs_git_api = selected
@@ -824,6 +959,10 @@ fn preflight(git: &GitContext, selected: &[&str]) -> Result<()> {
 
     if selected.contains(&"cargo") && !command_exists("cargo") {
         missing.push("cargo command is required for: cargo".to_string());
+    }
+
+    if auto_tag_enabled && !command_exists("git") {
+        missing.push("git command is required when project.auto-tag is enabled".to_string());
     }
 
     let depends_on_git = selected
@@ -875,15 +1014,48 @@ pub fn release(
         return Ok(());
     }
 
-    preflight(&git, &selected)?;
+    let auto_tag_enabled = config.project.auto_tag && selected.contains(&"git");
+    preflight(&git, &selected, auto_tag_enabled)?;
 
-    let version = detect_version(config, version_override)?;
+    let version = if auto_tag_enabled {
+        let manifest_version = detect_manifest_version()?;
+        if let Some(override_version) = version_override {
+            let normalized_override = normalize_version(override_version);
+            if normalized_override != manifest_version {
+                bail!(
+                    "--version ({normalized_override}) does not match manifest version ({manifest_version}) while project.auto-tag is enabled"
+                );
+            }
+        }
+        println!("[tag] Using manifest version {manifest_version} from Cargo.toml");
+        manifest_version
+    } else {
+        detect_version(config, version_override)?
+    };
+
+    if auto_tag_enabled {
+        create_and_push_tag(&version)?;
+    }
+
     let cargo_package = CargoPackageSelection::resolve(config, &selected)?;
     println!(
         "Releasing {} v{version} via: {}",
         config.project.name,
         selected.join(", ")
     );
+    let release_binaries = config.project.release_binaries();
+    if release_binaries.len() > 1 {
+        println!("Release binaries: {}", release_binaries.join(", "));
+        if selected
+            .iter()
+            .any(|ch| matches!(*ch, "homebrew" | "curl" | "nix"))
+        {
+            println!(
+                "Note: homebrew/curl/nix use primary binary '{}'; all binaries are uploaded as git release assets.",
+                config.project.primary_binary()
+            );
+        }
+    }
 
     let archives = build_artifacts(config, &version, cargo_package.as_ref())?;
 
@@ -1022,13 +1194,19 @@ fn release_git(
     config: &Config,
     git: &GitContext,
     version: &str,
-    archives: &[(String, PathBuf)],
+    archives: &[BuiltArchive],
 ) -> Result<()> {
     let upload_url = create_release(git, &config.project.repo, version)?;
-    for (_, path) in archives {
-        let name = path.file_name().unwrap().to_string_lossy();
-        delete_existing_asset_if_any(git, &config.project.repo, version, &name)?;
-        git_upload_asset(git, "git", &upload_url, path, &name, "application/gzip")?;
+    for archive in archives {
+        delete_existing_asset_if_any(git, &config.project.repo, version, &archive.asset_name)?;
+        git_upload_asset(
+            git,
+            "git",
+            &upload_url,
+            &archive.archive_path,
+            &archive.asset_name,
+            "application/gzip",
+        )?;
     }
     println!("[git] Created release v{version}");
     Ok(())
@@ -1038,11 +1216,11 @@ fn release_homebrew(
     config: &Config,
     git: &GitContext,
     version: &str,
-    archives: &[(String, PathBuf)],
+    archives: &[BuiltArchive],
 ) -> Result<()> {
     let ch = config.channels.homebrew.as_ref().unwrap();
     let formula_name = ch.formula_name.as_deref().unwrap_or(&config.project.name);
-    let binary = config.project.binary();
+    let binary = config.project.primary_binary();
     let repo = &config.project.repo;
 
     let release_url = git.repo_api_url(repo, &format!("/releases/tags/v{version}"));
@@ -1050,7 +1228,7 @@ fn release_homebrew(
         format!("[homebrew] release v{version} not found — run the git channel first")
     })?;
 
-    let (darwin_arm_sha, darwin_intel_sha) = homebrew_macos_shas(archives)?;
+    let (darwin_arm_sha, darwin_intel_sha) = homebrew_macos_shas(archives, binary)?;
 
     let formula = generate_formula(
         formula_name,
@@ -1083,26 +1261,29 @@ fn release_homebrew(
     Ok(())
 }
 
-fn homebrew_macos_shas(archives: &[(String, PathBuf)]) -> Result<(String, String)> {
+fn homebrew_macos_shas(archives: &[BuiltArchive], binary: &str) -> Result<(String, String)> {
     let mut darwin_arm: Option<&PathBuf> = None;
     let mut darwin_intel: Option<&PathBuf> = None;
 
-    for (target, path) in archives {
-        if target == "aarch64-apple-darwin" {
-            darwin_arm = Some(path);
-        } else if target == "x86_64-apple-darwin" {
-            darwin_intel = Some(path);
+    for archive in archives {
+        if archive.binary != binary {
+            continue;
+        }
+        if archive.target == "aarch64-apple-darwin" {
+            darwin_arm = Some(&archive.archive_path);
+        } else if archive.target == "x86_64-apple-darwin" {
+            darwin_intel = Some(&archive.archive_path);
         }
     }
 
     let darwin_arm = darwin_arm.ok_or_else(|| {
         anyhow::anyhow!(
-            "[homebrew] missing artifact for target aarch64-apple-darwin; build it or disable channels.homebrew"
+            "[homebrew] missing artifact for binary {binary} target aarch64-apple-darwin; build it or disable channels.homebrew"
         )
     })?;
     let darwin_intel = darwin_intel.ok_or_else(|| {
         anyhow::anyhow!(
-            "[homebrew] missing artifact for target x86_64-apple-darwin; build it or disable channels.homebrew"
+            "[homebrew] missing artifact for binary {binary} target x86_64-apple-darwin; build it or disable channels.homebrew"
         )
     })?;
 
@@ -1162,7 +1343,7 @@ fn release_cargo(config: &Config, cargo_package: Option<&CargoPackageSelection>)
 }
 
 fn release_curl(config: &Config, git: &GitContext, version: &str) -> Result<()> {
-    let binary = config.project.binary();
+    let binary = config.project.primary_binary();
     let repo = &config.project.repo;
 
     let script = generate_install_script(binary, repo, version, &git.web_base_url);
@@ -1225,9 +1406,13 @@ echo "Downloading $BINARY v$VERSION for $TARGET..."
 curl -fsSL "$URL" | tar xz -C "$TMPDIR"
 
 if [ -z "${{INSTALL_DIR:-}}" ]; then
-  printf "Install directory [/usr/local/bin]: "
-  read -r INSTALL_DIR
-  INSTALL_DIR="${{INSTALL_DIR:-/usr/local/bin}}"
+  if [ -t 0 ] && [ -r /dev/tty ]; then
+    printf "Install directory [/usr/local/bin]: " > /dev/tty
+    read -r INSTALL_DIR < /dev/tty || true
+    INSTALL_DIR="${{INSTALL_DIR:-/usr/local/bin}}"
+  else
+    INSTALL_DIR="/usr/local/bin"
+  fi
 fi
 install -d "$INSTALL_DIR"
 install "$TMPDIR/$BINARY" "$INSTALL_DIR/$BINARY"
@@ -1309,10 +1494,10 @@ fn release_nix(
     config: &Config,
     git: &GitContext,
     version: &str,
-    archives: &[(String, PathBuf)],
+    archives: &[BuiltArchive],
 ) -> Result<()> {
     let ch = config.channels.nix.as_ref().unwrap();
-    let binary = config.project.binary();
+    let binary = config.project.primary_binary();
     let repo = &config.project.repo;
     let flake_repo = ch.flake_repo.as_deref().unwrap_or(repo);
 
@@ -1326,19 +1511,24 @@ fn release_nix(
     std::fs::create_dir_all(&staging)?;
 
     let mut system_hashes = Vec::new();
-    for (target, _) in archives {
+    for archive in archives {
+        if archive.binary != binary {
+            continue;
+        }
+
+        let target = &archive.target;
         let nix_sys = match nix_system(target) {
             Some(s) => s,
             None => continue,
         };
-        let asset_name = format!("{binary}-{version}-{target}.tar.gz");
-        let download_url = git.release_download_url(repo, version, &asset_name);
+        let asset_name = archive.asset_name.as_str();
+        let download_url = git.release_download_url(repo, version, asset_name);
 
         // Verify asset exists in the release
         let assets = release["assets"].as_array();
         let asset_exists = assets.is_some_and(|a| {
             a.iter()
-                .any(|asset| asset["name"].as_str() == Some(&asset_name))
+                .any(|asset| asset["name"].as_str() == Some(asset_name))
         });
         if !asset_exists {
             eprintln!("[nix] Warning: asset {asset_name} not found in release, skipping");
@@ -1561,18 +1751,25 @@ mod tests {
 
     #[test]
     fn homebrew_macos_shas_requires_arm_archive() {
-        let archives = vec![(
-            "x86_64-unknown-linux-gnu".to_string(),
-            PathBuf::from("unused"),
-        )];
-        let err = homebrew_macos_shas(&archives).unwrap_err();
+        let archives = vec![BuiltArchive {
+            binary: "tool".to_string(),
+            target: "x86_64-unknown-linux-gnu".to_string(),
+            asset_name: "unused.tar.gz".to_string(),
+            archive_path: PathBuf::from("unused"),
+        }];
+        let err = homebrew_macos_shas(&archives, "tool").unwrap_err();
         assert!(err.to_string().contains("aarch64-apple-darwin"));
     }
 
     #[test]
     fn homebrew_macos_shas_requires_intel_archive() {
-        let archives = vec![("aarch64-apple-darwin".to_string(), PathBuf::from("unused"))];
-        let err = homebrew_macos_shas(&archives).unwrap_err();
+        let archives = vec![BuiltArchive {
+            binary: "tool".to_string(),
+            target: "aarch64-apple-darwin".to_string(),
+            asset_name: "unused.tar.gz".to_string(),
+            archive_path: PathBuf::from("unused"),
+        }];
+        let err = homebrew_macos_shas(&archives, "tool").unwrap_err();
         assert!(err.to_string().contains("x86_64-apple-darwin"));
     }
 
@@ -1590,6 +1787,55 @@ mod tests {
     #[test]
     fn parse_host_target_missing() {
         assert_eq!(parse_host_target("no host here\n"), None);
+    }
+
+    #[test]
+    fn normalize_version_strips_v_prefix() {
+        assert_eq!(normalize_version("v1.2.3"), "1.2.3");
+        assert_eq!(normalize_version("1.2.3"), "1.2.3");
+    }
+
+    fn write_temp_manifest(content: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("releasor2000-test-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Cargo.toml");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn rust_manifest_version_reads_package_version() {
+        let path = write_temp_manifest(
+            r#"
+[package]
+name = "mytool"
+version = "1.2.3"
+"#,
+        );
+        let version = rust_manifest_version(&path).unwrap();
+        assert_eq!(version, "1.2.3");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn rust_manifest_version_rejects_missing_package_version() {
+        let path = write_temp_manifest(
+            r#"
+[workspace]
+members = ["app"]
+"#,
+        );
+        let err = rust_manifest_version(&path).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("workspace roots without package.version are not supported"),
+            "got: {err}"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     // --- needs_cross_linker tests ---
@@ -1931,7 +2177,14 @@ targets = ["x86_64-apple-darwin"]
     fn generate_install_script_prompts_for_install_dir() {
         let script = generate_install_script("tool", "owner/repo", "1.0.0", GITHUB_BASE_URL);
         assert!(script.contains("printf \"Install directory [/usr/local/bin]: \""));
-        assert!(script.contains("read -r INSTALL_DIR"));
+        assert!(script.contains("read -r INSTALL_DIR < /dev/tty || true"));
+    }
+
+    #[test]
+    fn generate_install_script_defaults_install_dir_when_non_interactive() {
+        let script = generate_install_script("tool", "owner/repo", "1.0.0", GITHUB_BASE_URL);
+        assert!(script.contains("if [ -t 0 ] && [ -r /dev/tty ]; then"));
+        assert!(script.contains("INSTALL_DIR=\"/usr/local/bin\""));
     }
 
     // --- nix_system tests ---
@@ -2076,7 +2329,7 @@ targets = ["x86_64-apple-darwin"]
     #[test]
     fn preflight_ok_with_no_channels() {
         let git = github_git();
-        assert!(preflight(&git, &[]).is_ok());
+        assert!(preflight(&git, &[], false).is_ok());
     }
 
     #[test]
@@ -2086,7 +2339,7 @@ targets = ["x86_64-apple-darwin"]
         unsafe { std::env::remove_var("GITHUB_TOKEN") };
 
         let git = github_git();
-        let err = preflight(&git, &["git"]).unwrap_err();
+        let err = preflight(&git, &["git"], false).unwrap_err();
         assert!(err.to_string().contains("GITHUB_TOKEN"), "got: {err}");
 
         if let Some(val) = saved {
@@ -2106,7 +2359,7 @@ targets = ["x86_64-apple-darwin"]
             accept_header: "application/json",
             is_github: false,
         };
-        let err = preflight(&git, &["git"]).unwrap_err();
+        let err = preflight(&git, &["git"], false).unwrap_err();
         assert!(err.to_string().contains("GITEA_TOKEN"), "got: {err}");
         if let Some(val) = saved {
             unsafe { std::env::set_var("GITEA_TOKEN", val) };
@@ -2127,7 +2380,7 @@ targets = ["x86_64-apple-darwin"]
         unsafe { std::env::set_var("GITHUB_TOKEN", "fake-token-for-test") };
 
         let git = github_git();
-        let err = preflight(&git, &["git", "nix"]).unwrap_err();
+        let err = preflight(&git, &["git", "nix"], false).unwrap_err();
         assert!(err.to_string().contains("nix command"), "got: {err}");
 
         match saved {
@@ -2144,7 +2397,7 @@ targets = ["x86_64-apple-darwin"]
 
         let git = github_git();
         for ch in &["homebrew", "curl", "nix"] {
-            let err = preflight(&git, &[*ch]).unwrap_err();
+            let err = preflight(&git, &[*ch], false).unwrap_err();
             assert!(
                 err.to_string().contains("git channel must be selected"),
                 "channel {ch}: got: {err}"
@@ -2155,5 +2408,18 @@ targets = ["x86_64-apple-darwin"]
             Some(val) => unsafe { std::env::set_var("GITHUB_TOKEN", val) },
             None => unsafe { std::env::remove_var("GITHUB_TOKEN") },
         }
+    }
+
+    #[test]
+    fn preflight_requires_git_command_when_auto_tag_enabled() {
+        if command_exists("git") {
+            return;
+        }
+        let git = github_git();
+        let err = preflight(&git, &["git"], true).unwrap_err();
+        assert!(
+            err.to_string().contains("git command is required"),
+            "got: {err}"
+        );
     }
 }

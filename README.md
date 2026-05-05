@@ -43,9 +43,14 @@ releasor2000 init
 # Edit releasor2000.toml to set your repo and enable channels
 $EDITOR releasor2000.toml
 
-# Tag a version and release
-git tag v0.1.0
+# Optional: enable [project].auto-tag in releasor2000.toml
+# auto-tag = true
+
+# Release
 releasor2000 release
+
+# Upgrade releasor2000 itself in place
+releasor2000 upgrade
 ```
 
 You can also pass `--version` directly:
@@ -69,10 +74,12 @@ Use `releasor2000 validate` to check your config without releasing.
 ```toml
 [project]
 name = "myapp"
-# binary = "myapp"   # defaults to project name
+# auto-tag = true  # read Cargo.toml version and create/push v<version> before git release
+# binary = "myapp"  # defaults to project name
 # package = "myapp"  # optional workspace package override; auto-detected from binary when unique
+# binaries = ["myapp", "myapp-cli"]  # optional extra release assets
 repo = "owner/myapp"
-# version_command = "git describe --tags --abbrev=0"
+# version-command = "git describe --tags --abbrev=0"
 
 [build]
 command = "cargo build --release --target {target}"
@@ -86,44 +93,51 @@ targets = [
 
 [git]
 # type = "gitea"                  # defaults to "github"
-# base_url = "https://git.example.com"
-# api_base_url = "https://git.example.com/api/v1"  # optional override
-# token_env = "GITEA_TOKEN"       # defaults: GITHUB_TOKEN or GITEA_TOKEN
+# base-url = "https://git.example.com"
+# api-base-url = "https://git.example.com/api/v1"  # optional override
+# token-env = "GITEA_TOKEN"       # defaults: GITHUB_TOKEN or GITEA_TOKEN
 
 [channels.git]
 enabled = true
 
 # [channels.homebrew]
 # tap = "owner/homebrew-tap"
-# formula_name = "myapp"
+# formula-name = "myapp"
 
 # [channels.cargo]
-# crate_name = "myapp"
+# crate-name = "myapp"
 
 # [channels.curl]
 
 # [channels.nix]
-# flake_repo = "owner/nix-repo"  # defaults to project repo
+# flake-repo = "owner/nix-repo"  # defaults to project repo
 ```
+
+Underscore config keys are still accepted for compatibility, but they are deprecated in favor of dashed keys and emit warnings.
 
 ### Project fields
 
 | Field | Required | Description |
 |---|---|---|
 | `name` | yes | Project name |
-| `binary` | no | Binary name (defaults to `name`) |
+| `binary` | no | Primary binary for single-binary channels (defaults to `name`) |
 | `package` | no | Cargo workspace package override (auto-detected from `binary` when unique) |
+| `binaries` | no | Additional binaries to package/upload as release assets |
 | `repo` | yes | Repository path (`owner/repo`) |
-| `version_command` | no | Shell command to detect version (defaults to `git describe --tags --abbrev=0`) |
+| `auto-tag` | no | If true, use `Cargo.toml` package version and create/push annotated git tag `v<version>` when releasing to `git` |
+| `version-command` | no | Shell command to detect version (defaults to `git describe --tags --abbrev=0`) |
+
+If `binaries` is set, releasor2000 builds/packages each `{binary}` per target and uploads each archive as its own release asset. If both `binary` and `binaries` are set, `binary` must be included in `binaries`.
+When `auto-tag = true`, releasor2000 currently supports Rust projects (`Cargo.toml` with `[package].version`) and fails if tag `v<version>` already exists locally or on `origin`.
 
 ### Git fields
 
 | Field | Required | Description |
 |---|---|---|
 | `type` | no | Git type: `github` (default) or `gitea` |
-| `base_url` | no | Web base URL (defaults to `https://github.com` for GitHub) |
-| `api_base_url` | no | API base URL override (Gitea defaults to `{base_url}/api/v1`) |
-| `token_env` | no | Token env var override (defaults to `GITHUB_TOKEN` or `GITEA_TOKEN`) |
+| `base-url` | no | Web base URL (defaults to `https://github.com` for GitHub) |
+| `api-base-url` | no | API base URL override (Gitea defaults to `{base-url}/api/v1`) |
+| `token-env` | no | Token env var override (defaults to `GITHUB_TOKEN` or `GITEA_TOKEN`) |
 
 ### Build fields
 
@@ -131,10 +145,10 @@ enabled = true
 |---|---|---|
 | `command` | yes* | Build command template. Supports `{target}`, `{binary}`, `{package}`, `{version}` placeholders |
 | `artifact` | yes* | Path to built artifact. Same placeholders as `command` |
-| `pre_built_dir` | yes* | Directory with pre-built binaries (mutually exclusive with `command`) |
+| `pre-built-dir` | yes* | Directory with pre-built binaries (mutually exclusive with `command`) |
 | `targets` | yes | List of Rust target triples to build for |
 
-*Either `command`+`artifact` or `pre_built_dir` is required.
+*Either `command`+`artifact` or `pre-built-dir` is required.
 
 ## Channels
 
@@ -142,7 +156,7 @@ The `git` channel always runs first — it creates the release on your git host 
 
 ### Release (`git` channel)
 
-Creates a release and uploads `.tar.gz` archives for each target.
+Creates a release and uploads `.tar.gz` archives for each binary/target combination.
 
 ```toml
 [channels.git]
@@ -156,12 +170,13 @@ Archives are named `{binary}-{version}-{target}.tar.gz`.
 ### Homebrew
 
 Generates a Homebrew formula and pushes it to your tap repository. Only includes macOS targets.
-Download URLs in the formula are built from your git host `base_url`.
+Download URLs in the formula are built from your git host `base-url`.
+Uses the primary binary (`project.binary`, or the first item in `project.binaries`).
 
 ```toml
 [channels.homebrew]
 tap = "owner/homebrew-tap"       # required
-formula_name = "myapp"           # defaults to project name
+formula-name = "myapp"           # defaults to project name
 ```
 
 ### Cargo
@@ -170,7 +185,7 @@ Publishes the crate to crates.io via `cargo publish`.
 
 ```toml
 [channels.cargo]
-crate_name = "myapp"  # defaults to project name
+crate-name = "myapp"  # defaults to project name
 ```
 
 Requires prior `cargo login`.
@@ -180,6 +195,7 @@ In Cargo workspaces, releasor2000 auto-detects the package when exactly one work
 ### Curl
 
 Generates an `install.sh` script that detects OS/arch and downloads the right binary from your configured git host, then uploads it to the release.
+Uses the primary binary (`project.binary`, or the first item in `project.binaries`).
 
 ```toml
 [channels.curl]
@@ -190,11 +206,12 @@ The generated script has the version baked in and is uploaded to the release as 
 ### Nix
 
 Generates a `flake.nix` and `flake.lock` and pushes them to a repository.
-Source URLs are built from your git host `base_url`.
+Source URLs are built from your git host `base-url`.
+Uses the primary binary (`project.binary`, or the first item in `project.binaries`).
 
 ```toml
 [channels.nix]
-flake_repo = "owner/nix-repo"  # defaults to project repo
+flake-repo = "owner/nix-repo"  # defaults to project repo
 ```
 
 Requires the `nix` command to be available.
@@ -212,7 +229,7 @@ macOS targets can cross-compile between x86_64 and aarch64 natively on macOS. Bu
 
 ## Requirements
 
-- **Git token env var** — required for channels that interact with git APIs (`git`, `homebrew`, `curl`, `nix`); defaults are `GITHUB_TOKEN` (GitHub) and `GITEA_TOKEN` (Gitea), and you can override with `[git].token_env`
+- **Git token env var** — required for channels that interact with git APIs (`git`, `homebrew`, `curl`, `nix`); defaults are `GITHUB_TOKEN` (GitHub) and `GITEA_TOKEN` (Gitea), and you can override with `[git].token-env`
 - **rustup targets** — install targets with `rustup target add <target>`
 - **cargo-zigbuild** (optional) — preferred cross-compilation backend
 - **cross** (optional) — fallback cross-compilation backend
