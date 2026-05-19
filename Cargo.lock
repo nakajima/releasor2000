@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "releasor2000"
-version = "0.1.7"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "base64",

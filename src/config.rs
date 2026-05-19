@@ -185,7 +185,7 @@ pub fn generate_template(project_name: &str) -> String {
     format!(
         r#"[project]
 name = "{project_name}"
-# auto-tag = true  # detect Cargo.toml version, create/push git tag v<version> before releasing to git
+# auto-tag = true  # detect Cargo.toml version and keep git tag v<version> only after a successful release
 # binary = "{project_name}"  # defaults to project name
 # package = "{project_name}"  # optional workspace package override; auto-detected from binary when unique
 # binaries = ["{project_name}", "{project_name}-cli"]  # optional extra release assets

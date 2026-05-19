@@ -74,7 +74,7 @@ Use `releasor2000 validate` to check your config without releasing.
 ```toml
 [project]
 name = "myapp"
-# auto-tag = true  # read Cargo.toml version and create/push v<version> before git release
+# auto-tag = true  # read Cargo.toml version and keep v<version> only after a successful release
 # binary = "myapp"  # defaults to project name
 # package = "myapp"  # optional workspace package override; auto-detected from binary when unique
 # binaries = ["myapp", "myapp-cli"]  # optional extra release assets
@@ -124,11 +124,11 @@ Underscore config keys are still accepted for compatibility, but they are deprec
 | `package` | no | Cargo workspace package override (auto-detected from `binary` when unique) |
 | `binaries` | no | Additional binaries to package/upload as release assets |
 | `repo` | yes | Repository path (`owner/repo`) |
-| `auto-tag` | no | If true, use `Cargo.toml` package version and create/push annotated git tag `v<version>` when releasing to `git` |
+| `auto-tag` | no | If true, use `Cargo.toml` package version and create/push annotated git tag `v<version>` when releasing to `git`; try to remove it if the release fails |
 | `version-command` | no | Shell command to detect version (defaults to `git describe --tags --abbrev=0`) |
 
 If `binaries` is set, releasor2000 builds/packages each `{binary}` per target and uploads each archive as its own release asset. If both `binary` and `binaries` are set, `binary` must be included in `binaries`.
-When `auto-tag = true`, releasor2000 supports Rust packages and Cargo workspace roots. In workspaces, it uses the same binary-to-package detection as release builds, or `[project].package` if set. It fails if tag `v<version>` already exists locally or on `origin`.
+When `auto-tag = true`, releasor2000 supports Rust packages and Cargo workspace roots. In workspaces, it uses the same binary-to-package detection as release builds, or `[project].package` if set. It fails if tag `v<version>` already exists locally or on `origin`. The tag is created only after artifacts build successfully; if a later release step fails, releasor2000 tries to remove the tag locally and from `origin`.
 
 ### Git fields
 

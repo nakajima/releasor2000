@@ -303,20 +303,99 @@ fn remote_tag_exists(tag: &str) -> Result<bool> {
     bail!("[tag] could not check remote tag {tag} on origin: {stderr}");
 }
 
-fn create_and_push_tag(version: &str) -> Result<()> {
-    let tag = format!("v{version}");
-    if local_tag_exists(&tag)? {
-        bail!("[tag] tag {tag} already exists locally");
-    }
-    if remote_tag_exists(&tag)? {
-        bail!("[tag] tag {tag} already exists on origin");
+#[derive(Debug)]
+struct CreatedTag {
+    tag: String,
+    local_created: bool,
+    remote_created: bool,
+}
+
+impl CreatedTag {
+    fn ensure_available(version: &str) -> Result<()> {
+        let tag = format!("v{version}");
+        if local_tag_exists(&tag)? {
+            bail!("[tag] tag {tag} already exists locally");
+        }
+        if remote_tag_exists(&tag)? {
+            bail!("[tag] tag {tag} already exists on origin");
+        }
+        Ok(())
     }
 
-    let message = format!("Release {tag}");
-    run_cmd("tag", None, "git", &["tag", "-a", &tag, "-m", &message])?;
-    run_cmd("tag", None, "git", &["push", "origin", &tag])?;
-    println!("[tag] Created and pushed {tag}");
-    Ok(())
+    fn create_and_push(version: &str) -> Result<Self> {
+        Self::ensure_available(version)?;
+
+        let mut created = Self {
+            tag: format!("v{version}"),
+            local_created: false,
+            remote_created: false,
+        };
+        let message = format!("Release {}", created.tag);
+        run_cmd(
+            "tag",
+            None,
+            "git",
+            &["tag", "-a", &created.tag, "-m", &message],
+        )?;
+        created.local_created = true;
+
+        if let Err(push_err) = run_cmd("tag", None, "git", &["push", "origin", &created.tag]) {
+            let tag = created.tag.clone();
+            if let Err(cleanup_err) = created.rollback() {
+                return Err(push_err.context(format!(
+                    "[tag] additionally failed to remove {tag} after push failure: {cleanup_err}"
+                )));
+            }
+            return Err(push_err);
+        }
+        created.remote_created = true;
+
+        println!("[tag] Created and pushed {}", created.tag);
+        Ok(created)
+    }
+
+    fn rollback(mut self) -> Result<()> {
+        let had_tag = self.local_created || self.remote_created;
+        let mut errors = Vec::new();
+
+        if self.remote_created {
+            match self.delete_remote_if_exists() {
+                Ok(()) => self.remote_created = false,
+                Err(err) => errors.push(format!("remote tag {}: {err}", self.tag)),
+            }
+        }
+
+        if self.local_created {
+            match self.delete_local_if_exists() {
+                Ok(()) => self.local_created = false,
+                Err(err) => errors.push(format!("local tag {}: {err}", self.tag)),
+            }
+        }
+
+        if errors.is_empty() {
+            if had_tag {
+                eprintln!("[tag] Removed {} after unsuccessful release", self.tag);
+            }
+            Ok(())
+        } else {
+            bail!("[tag] cleanup failed:\n  - {}", errors.join("\n  - "));
+        }
+    }
+
+    fn delete_local_if_exists(&self) -> Result<()> {
+        if local_tag_exists(&self.tag)? {
+            run_cmd("tag", None, "git", &["tag", "-d", &self.tag])?;
+        }
+        Ok(())
+    }
+
+    fn delete_remote_if_exists(&self) -> Result<()> {
+        if remote_tag_exists(&self.tag)? {
+            let refspec = format!(":refs/tags/{}", self.tag);
+            run_cmd("tag", None, "git", &["push", "origin", &refspec])?;
+        }
+        Ok(())
+    }
 }
 
 fn detect_version(config: &Config, version_override: Option<&str>) -> Result<String> {
@@ -1110,7 +1189,7 @@ pub fn release(
     };
 
     if auto_tag_enabled {
-        create_and_push_tag(&version)?;
+        CreatedTag::ensure_available(&version)?;
     }
 
     println!(
@@ -1134,6 +1213,12 @@ pub fn release(
 
     let archives = build_artifacts(config, &version, cargo_package.as_ref())?;
 
+    let created_tag = if auto_tag_enabled {
+        Some(CreatedTag::create_and_push(&version)?)
+    } else {
+        None
+    };
+
     // Run git first so other channels can reference release URLs
     let ordered: Vec<&str> = {
         let mut v = Vec::new();
@@ -1148,15 +1233,29 @@ pub fn release(
         v
     };
 
-    for channel in &ordered {
-        match *channel {
-            "git" => release_git(config, &git, &version, &archives)?,
-            "homebrew" => release_homebrew(config, &git, &version, &archives)?,
-            "cargo" => release_cargo(config, cargo_package.as_ref())?,
-            "curl" => release_curl(config, &git, &version)?,
-            "nix" => release_nix(config, &git, &version, &archives)?,
-            _ => unreachable!(),
+    let release_result = (|| -> Result<()> {
+        for channel in &ordered {
+            match *channel {
+                "git" => release_git(config, &git, &version, &archives)?,
+                "homebrew" => release_homebrew(config, &git, &version, &archives)?,
+                "cargo" => release_cargo(config, cargo_package.as_ref())?,
+                "curl" => release_curl(config, &git, &version)?,
+                "nix" => release_nix(config, &git, &version, &archives)?,
+                _ => unreachable!(),
+            }
         }
+        Ok(())
+    })();
+
+    if let Err(err) = release_result {
+        if let Some(created_tag) = created_tag {
+            if let Err(cleanup_err) = created_tag.rollback() {
+                return Err(err.context(format!(
+                    "[tag] additionally failed to remove v{version} after unsuccessful release: {cleanup_err}"
+                )));
+            }
+        }
+        return Err(err);
     }
 
     println!("Done.");
@@ -1880,6 +1979,83 @@ mod tests {
         let path = dir.join("Cargo.toml");
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    struct TempGitRepo {
+        root: PathBuf,
+        previous_dir: PathBuf,
+    }
+
+    impl TempGitRepo {
+        fn new(name: &str) -> Option<Self> {
+            if !command_exists("git") {
+                return None;
+            }
+
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("{name}-{stamp}"));
+            let remote = root.join("origin.git");
+            let repo = root.join("repo");
+            std::fs::create_dir_all(&root).unwrap();
+
+            Self::run_git(None, &["init", "--bare", remote.to_str().unwrap()]);
+            Self::run_git(None, &["init", repo.to_str().unwrap()]);
+            Self::run_git(Some(&repo), &["config", "user.email", "test@example.com"]);
+            Self::run_git(Some(&repo), &["config", "user.name", "Test User"]);
+            std::fs::write(repo.join("README.md"), "test\n").unwrap();
+            Self::run_git(Some(&repo), &["add", "."]);
+            Self::run_git(Some(&repo), &["commit", "-m", "initial"]);
+            Self::run_git(
+                Some(&repo),
+                &["remote", "add", "origin", remote.to_str().unwrap()],
+            );
+            Self::run_git(Some(&repo), &["push", "-u", "origin", "HEAD"]);
+
+            let previous_dir = std::env::current_dir().unwrap();
+            std::env::set_current_dir(&repo).unwrap();
+
+            Some(Self { root, previous_dir })
+        }
+
+        fn run_git(dir: Option<&Path>, args: &[&str]) {
+            let mut command = Command::new("git");
+            if let Some(dir) = dir {
+                command.current_dir(dir);
+            }
+            let output = command.args(args).output().unwrap();
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    impl Drop for TempGitRepo {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.previous_dir).ok();
+            std::fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    #[test]
+    fn created_tag_rollback_removes_local_and_remote_tags() {
+        let Some(_repo) = TempGitRepo::new("releasor2000-tag-rollback") else {
+            return;
+        };
+
+        let created = CreatedTag::create_and_push("9.9.9").unwrap();
+        assert!(local_tag_exists("v9.9.9").unwrap());
+        assert!(remote_tag_exists("v9.9.9").unwrap());
+
+        created.rollback().unwrap();
+
+        assert!(!local_tag_exists("v9.9.9").unwrap());
+        assert!(!remote_tag_exists("v9.9.9").unwrap());
     }
 
     #[test]
