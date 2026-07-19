@@ -84,6 +84,8 @@ repo = "owner/myapp"
 [build]
 command = "cargo build --release --target {target}"
 artifact = "target/{target}/release/{binary}"
+# archive-format = "tar-gz"  # tar-gz, zip, or none
+# asset-name = "{binary}-{version}-{target}.tar.gz"  # optional release asset name template
 targets = [
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
@@ -146,9 +148,28 @@ When `auto-tag = true`, releasor2000 supports Rust packages and Cargo workspace 
 | `command` | yes* | Build command template. Supports `{target}`, `{binary}`, `{package}`, `{version}` placeholders |
 | `artifact` | yes* | Path to built artifact. Same placeholders as `command` |
 | `pre-built-dir` | yes* | Directory with pre-built binaries (mutually exclusive with `command`) |
-| `targets` | yes | List of Rust target triples to build for |
+| `targets` | yes | List of release targets. Rust target triples are expected by Homebrew, curl, and Nix channels. |
+| `archive-format` | no | Release asset packaging: `tar-gz` (default), `zip`, or `none`. Defaults to `zip` for `[mac-app]`. |
+| `asset-name` | no | Release asset file name template. Supports `{target}`, `{binary}`, `{package}`, `{version}`, and `{app-name}` for `[mac-app]`. |
 
-*Either `command`+`artifact` or `pre-built-dir` is required.
+*Either `command`+`artifact` or `pre-built-dir` is required unless `[mac-app]` is configured.
+
+### Mac app fields
+
+| Field | Required | Description |
+|---|---|---|
+| `project` / `workspace` | no | Xcode project or workspace path. If omitted, releasor2000 uses the single workspace/project in the repo root. |
+| `scheme` | no | Xcode scheme to archive. If omitted, releasor2000 derives the single macOS app scheme from Xcode build settings. |
+| `app-name` | no | Exported app bundle name without or with `.app`. If omitted, releasor2000 derives it from Xcode build settings or the exported app. |
+| `configuration` | no | Xcode configuration, defaults to `Release` |
+| `destination` | no | Xcode archive destination, defaults to `generic/platform=macOS` |
+| `export-method` | no | Xcode export method, defaults to `developer-id` |
+| `team-id` | no | Apple Developer Team ID. If omitted, releasor2000 derives it from Xcode `DEVELOPMENT_TEAM`, then falls back to `APPLE_TEAM_ID`. |
+| `notarize` | no | Defaults to `true` |
+| `notary-profile` | no | notarytool keychain profile. If unset, uses Apple ID env vars. |
+| `apple-id-env` | no | Env var for Apple ID, defaults to `APPLE_ID` |
+| `password-env` | no | Env var for app-specific password, defaults to `APPLE_APP_SPECIFIC_PASSWORD` |
+| `team-id-env` | no | Env var for team ID, defaults to `APPLE_TEAM_ID` |
 
 ## Channels
 
@@ -156,7 +177,7 @@ The `git` channel always runs first — it creates the release on your git host 
 
 ### Release (`git` channel)
 
-Creates a release and uploads `.tar.gz` archives for each binary/target combination.
+Creates a release and uploads an asset for each binary/target combination. By default assets are `.tar.gz` archives named `{binary}-{version}-{target}.tar.gz`. Set `[build].archive-format = "zip"` for zipped directory artifacts such as `.app` bundles, or `"none"` to upload the configured artifact directly. Custom asset formats/names are supported by the git channel only; Homebrew, curl, and Nix still require default tar-gz binary assets.
 
 ```toml
 [channels.git]
@@ -165,7 +186,38 @@ enabled = true
 
 On GitHub, release notes are auto-generated. On Gitea, a basic release is created.
 
-Archives are named `{binary}-{version}-{target}.tar.gz`.
+### Mac app releases
+
+For local macOS app distribution, add `[mac-app]`. releasor2000 archives the Xcode project/workspace, exports a Developer ID signed app, notarizes it, staples the ticket, zips the `.app`, and uploads it to the GitHub release.
+
+```toml
+[project]
+name = "Teletype"
+repo = "owner/repo"
+version-command = "scripts/version.sh"
+
+[build]
+targets = ["aarch64-apple-darwin"]
+# asset-name = "{app-name}-{version}-{target}.zip"
+
+[mac-app]
+# project = "Termsy.xcodeproj"      # derived when there is one project/workspace
+# scheme = "TermsyMac"              # derived when there is one macOS app scheme
+# app-name = "Teletype"             # derived from Xcode/exported app
+# team-id = "ABCDE12345"            # derived from DEVELOPMENT_TEAM when possible
+# configuration = "Release"
+# destination = "generic/platform=macOS"
+# export-method = "developer-id"
+# notarize = true
+# notary-profile = "notarytool-profile"  # alternative to APPLE_ID/password env vars
+
+[channels.git]
+enabled = true
+```
+
+Notarization uses `notarytool`. Either set `mac-app.notary-profile` for a stored keychain profile, or set `APPLE_ID` and `APPLE_APP_SPECIFIC_PASSWORD`. The team ID is derived from Xcode `DEVELOPMENT_TEAM` when possible, then `team-id`, then `APPLE_TEAM_ID`.
+
+Mac app releases currently support the `git` channel only. For `aarch64-apple-darwin` and `x86_64-apple-darwin` targets, releasor2000 passes the matching `ARCHS` value to `xcodebuild`; other target names are treated as asset labels.
 
 ### Homebrew
 

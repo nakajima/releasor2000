@@ -12,6 +12,8 @@ pub struct Config {
     pub git: Git,
     #[serde(default)]
     pub forge: Option<toml::Value>,
+    #[serde(default, rename = "mac-app", alias = "mac_app")]
+    pub mac_app: Option<MacApp>,
     #[serde(default)]
     pub channels: Channels,
 }
@@ -38,6 +40,45 @@ pub struct Build {
     #[serde(alias = "pre_built_dir")]
     pub pre_built_dir: Option<String>,
     pub targets: Vec<String>,
+    #[serde(alias = "archive_format")]
+    pub archive_format: Option<ArchiveFormat>,
+    #[serde(alias = "asset_name")]
+    pub asset_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct MacApp {
+    pub scheme: Option<String>,
+    pub project: Option<String>,
+    pub workspace: Option<String>,
+    #[serde(alias = "app_name")]
+    pub app_name: Option<String>,
+    pub configuration: Option<String>,
+    pub destination: Option<String>,
+    #[serde(alias = "export_method")]
+    pub export_method: Option<String>,
+    #[serde(alias = "team_id")]
+    pub team_id: Option<String>,
+    #[serde(default = "default_true")]
+    pub notarize: bool,
+    #[serde(alias = "notary_profile")]
+    pub notary_profile: Option<String>,
+    #[serde(alias = "apple_id_env")]
+    pub apple_id_env: Option<String>,
+    #[serde(alias = "password_env")]
+    pub password_env: Option<String>,
+    #[serde(alias = "team_id_env")]
+    pub team_id_env: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArchiveFormat {
+    #[default]
+    TarGz,
+    Zip,
+    None,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +164,36 @@ fn default_true() -> bool {
     true
 }
 
+impl MacApp {
+    pub fn configuration(&self) -> &str {
+        self.configuration.as_deref().unwrap_or("Release")
+    }
+
+    pub fn destination(&self) -> &str {
+        self.destination
+            .as_deref()
+            .unwrap_or("generic/platform=macOS")
+    }
+
+    pub fn export_method(&self) -> &str {
+        self.export_method.as_deref().unwrap_or("developer-id")
+    }
+
+    pub fn apple_id_env(&self) -> &str {
+        self.apple_id_env.as_deref().unwrap_or("APPLE_ID")
+    }
+
+    pub fn password_env(&self) -> &str {
+        self.password_env
+            .as_deref()
+            .unwrap_or("APPLE_APP_SPECIFIC_PASSWORD")
+    }
+
+    pub fn team_id_env(&self) -> &str {
+        self.team_id_env.as_deref().unwrap_or("APPLE_TEAM_ID")
+    }
+}
+
 impl Project {
     pub fn primary_binary(&self) -> &str {
         if let Some(binary) = self.binary.as_deref() {
@@ -195,6 +266,8 @@ repo = "owner/{project_name}"
 [build]
 command = "cargo build --release --target {{target}}"
 artifact = "target/{{target}}/release/{{binary}}"
+# archive-format = "tar-gz"  # tar-gz, zip, or none
+# asset-name = "{{binary}}-{{version}}-{{target}}.tar.gz"  # optional release asset name template
 targets = [
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
@@ -248,6 +321,16 @@ const KEY_MIGRATIONS: &[KeyMigration] = &[
         table_path: &["build"],
         dashed: "pre-built-dir",
         underscored: "pre_built_dir",
+    },
+    KeyMigration {
+        table_path: &["build"],
+        dashed: "archive-format",
+        underscored: "archive_format",
+    },
+    KeyMigration {
+        table_path: &["build"],
+        dashed: "asset-name",
+        underscored: "asset_name",
     },
     KeyMigration {
         table_path: &["git"],
@@ -326,6 +409,16 @@ fn check_key_migrations(raw: &Value) -> Result<()> {
 }
 
 impl Config {
+    pub fn archive_format(&self) -> ArchiveFormat {
+        self.build.archive_format.unwrap_or_else(|| {
+            if self.mac_app.is_some() {
+                ArchiveFormat::Zip
+            } else {
+                ArchiveFormat::TarGz
+            }
+        })
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let content =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -379,14 +472,51 @@ impl Config {
                 }
             }
         }
-        if self.build.command.is_some() && self.build.pre_built_dir.is_some() {
-            bail!("build.command and build.pre-built-dir are mutually exclusive");
+        if let Some(mac_app) = &self.mac_app {
+            let has_project = mac_app
+                .project
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+            let has_workspace = mac_app
+                .workspace
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+            if has_project && has_workspace {
+                bail!("mac-app requires at most one of project or workspace");
+            }
+            if mac_app
+                .scheme
+                .as_deref()
+                .is_some_and(|scheme| scheme.trim().is_empty())
+            {
+                bail!("mac-app.scheme must not be empty");
+            }
+            if self.project.binaries.is_some() {
+                bail!("mac-app releases do not support project.binaries");
+            }
+            if self.build.command.is_some()
+                || self.build.pre_built_dir.is_some()
+                || self.build.artifact.is_some()
+            {
+                bail!(
+                    "mac-app builds are handled by releasor2000; remove build.command, build.artifact, and build.pre-built-dir"
+                );
+            }
+        } else {
+            if self.build.command.is_some() && self.build.pre_built_dir.is_some() {
+                bail!("build.command and build.pre-built-dir are mutually exclusive");
+            }
+            if self.build.command.is_none() && self.build.pre_built_dir.is_none() {
+                bail!("one of build.command or build.pre-built-dir is required");
+            }
+            if self.build.command.is_some() && self.build.artifact.is_none() {
+                bail!("build.artifact is required when build.command is set");
+            }
         }
-        if self.build.command.is_none() && self.build.pre_built_dir.is_none() {
-            bail!("one of build.command or build.pre-built-dir is required");
-        }
-        if self.build.command.is_some() && self.build.artifact.is_none() {
-            bail!("build.artifact is required when build.command is set");
+        if let Some(asset_name) = self.build.asset_name.as_deref() {
+            if asset_name.trim().is_empty() {
+                bail!("build.asset-name must not be empty");
+            }
         }
         if self.build.targets.is_empty() {
             bail!("build.targets must not be empty");
@@ -455,6 +585,9 @@ targets = ["x86_64-apple-darwin"]
         assert!(config.project.version_command.is_none());
         assert!(!config.project.auto_tag);
         assert_eq!(config.build.targets.len(), 1);
+        assert!(config.build.archive_format.is_none());
+        assert_eq!(config.archive_format(), ArchiveFormat::TarGz);
+        assert!(config.build.asset_name.is_none());
         assert!(config.enabled_channels().is_empty());
     }
 
@@ -738,6 +871,184 @@ targets = []
         let err = Config::parse(toml).unwrap_err();
         assert!(
             err.to_string().contains("targets must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn archive_format_can_be_zip() {
+        let toml = r#"
+[project]
+name = "myapp"
+repo = "owner/repo"
+
+[build]
+command = "make"
+artifact = "build/MyApp.app"
+archive-format = "zip"
+asset-name = "MyApp-{version}-mac-arm64.zip"
+targets = ["aarch64-apple-darwin"]
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.build.archive_format, Some(ArchiveFormat::Zip));
+        assert_eq!(config.archive_format(), ArchiveFormat::Zip);
+        assert_eq!(
+            config.build.asset_name.as_deref(),
+            Some("MyApp-{version}-mac-arm64.zip")
+        );
+    }
+
+    #[test]
+    fn archive_format_can_be_none() {
+        let toml = r#"
+[project]
+name = "myapp"
+repo = "owner/repo"
+
+[build]
+command = "make"
+artifact = "dist/MyApp.zip"
+archive-format = "none"
+targets = ["aarch64-apple-darwin"]
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.build.archive_format, Some(ArchiveFormat::None));
+        assert_eq!(config.archive_format(), ArchiveFormat::None);
+    }
+
+    #[test]
+    fn archive_format_accepts_underscore_alias() {
+        let toml = r#"
+[project]
+name = "myapp"
+repo = "owner/repo"
+
+[build]
+command = "make"
+artifact = "build/MyApp.app"
+archive_format = "zip"
+asset_name = "MyApp-{version}.zip"
+targets = ["aarch64-apple-darwin"]
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.build.archive_format, Some(ArchiveFormat::Zip));
+        assert_eq!(
+            config.build.asset_name.as_deref(),
+            Some("MyApp-{version}.zip")
+        );
+    }
+
+    #[test]
+    fn empty_asset_name_rejected() {
+        let toml = r#"
+[project]
+name = "myapp"
+repo = "owner/repo"
+
+[build]
+command = "make"
+artifact = "out/bin"
+asset-name = "   "
+targets = ["x86_64-apple-darwin"]
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("build.asset-name must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn mac_app_config_uses_zip_by_default() {
+        let toml = r#"
+[project]
+name = "Teletype"
+repo = "owner/repo"
+
+[build]
+targets = ["aarch64-apple-darwin"]
+
+[mac-app]
+project = "Termsy.xcodeproj"
+scheme = "TermsyMac"
+app-name = "Teletype"
+team-id = "TEAM123"
+"#;
+        let config = Config::parse(toml).unwrap();
+        let mac_app = config.mac_app.as_ref().unwrap();
+        assert_eq!(mac_app.project.as_deref(), Some("Termsy.xcodeproj"));
+        assert_eq!(mac_app.scheme.as_deref(), Some("TermsyMac"));
+        assert_eq!(mac_app.app_name.as_deref(), Some("Teletype"));
+        assert_eq!(mac_app.configuration(), "Release");
+        assert_eq!(mac_app.destination(), "generic/platform=macOS");
+        assert_eq!(mac_app.export_method(), "developer-id");
+        assert!(mac_app.notarize);
+        assert_eq!(config.archive_format(), ArchiveFormat::Zip);
+    }
+
+    #[test]
+    fn mac_app_can_derive_xcode_settings() {
+        let toml = r#"
+[project]
+name = "Teletype"
+repo = "owner/repo"
+
+[build]
+targets = ["aarch64-apple-darwin"]
+
+[mac-app]
+"#;
+        let config = Config::parse(toml).unwrap();
+        let mac_app = config.mac_app.as_ref().unwrap();
+        assert!(mac_app.project.is_none());
+        assert!(mac_app.workspace.is_none());
+        assert!(mac_app.scheme.is_none());
+        assert!(mac_app.app_name.is_none());
+        assert!(mac_app.team_id.is_none());
+    }
+
+    #[test]
+    fn mac_app_rejects_project_and_workspace_together() {
+        let toml = r#"
+[project]
+name = "Teletype"
+repo = "owner/repo"
+
+[build]
+targets = ["aarch64-apple-darwin"]
+
+[mac-app]
+project = "Termsy.xcodeproj"
+workspace = "Termsy.xcworkspace"
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mac-app requires at most one of project or workspace"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn mac_app_rejects_command_builds() {
+        let toml = r#"
+[project]
+name = "Teletype"
+repo = "owner/repo"
+
+[build]
+command = "make"
+artifact = "build/Teletype.app"
+targets = ["aarch64-apple-darwin"]
+
+[mac-app]
+project = "Termsy.xcodeproj"
+scheme = "TermsyMac"
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("mac-app builds are handled"),
             "got: {err}"
         );
     }

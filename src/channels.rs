@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use toml::Value as TomlValue;
 
-use crate::config::{Config, GitType};
+use crate::config::{ArchiveFormat, Config, GitType, MacApp};
 
 // --- Shared infrastructure ---
 
@@ -70,7 +70,17 @@ impl GitContext {
 }
 
 fn run_cmd(label: &str, dir: Option<&Path>, cmd: &str, args: &[&str]) -> Result<String> {
-    println!("[{label}] Running: {cmd} {}", args.join(" "));
+    run_cmd_with_display(label, dir, cmd, args, &args.join(" "))
+}
+
+fn run_cmd_with_display(
+    label: &str,
+    dir: Option<&Path>,
+    cmd: &str,
+    args: &[&str],
+    display_args: &str,
+) -> Result<String> {
+    println!("[{label}] Running: {cmd} {display_args}");
     let mut command = Command::new(cmd);
     command.args(args);
     if let Some(d) = dir {
@@ -592,6 +602,11 @@ impl CargoPackageSelection {
                 .pre_built_dir
                 .as_ref()
                 .is_some_and(|template| template.contains("{package}"))
+            || config
+                .build
+                .asset_name
+                .as_ref()
+                .is_some_and(|template| template.contains("{package}"))
     }
 
     fn augment_build_command(&self, cmd_str: &str, binary: &str) -> String {
@@ -730,6 +745,783 @@ struct BuiltArchive {
     target: String,
     asset_name: String,
     archive_path: PathBuf,
+    content_type: &'static str,
+}
+
+fn artifact_file_name(artifact_path: &Path) -> Result<String> {
+    artifact_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .ok_or_else(|| anyhow::anyhow!("artifact has no filename"))
+}
+
+fn absolute_output_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("output path has no filename"))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    Ok(std::fs::canonicalize(parent)?.join(file_name))
+}
+
+fn default_asset_name(
+    archive_format: ArchiveFormat,
+    binary: &str,
+    version: &str,
+    target: &str,
+    artifact_path: &Path,
+) -> Result<String> {
+    match archive_format {
+        ArchiveFormat::TarGz => Ok(format!("{binary}-{version}-{target}.tar.gz")),
+        ArchiveFormat::Zip => Ok(format!("{binary}-{version}-{target}.zip")),
+        ArchiveFormat::None => artifact_file_name(artifact_path),
+    }
+}
+
+fn release_asset_name(
+    config: &Config,
+    binary: &str,
+    version: &str,
+    target: &str,
+    vars: &[(&str, &str)],
+    artifact_path: &Path,
+) -> Result<String> {
+    let default_name = default_asset_name(
+        config.archive_format(),
+        binary,
+        version,
+        target,
+        artifact_path,
+    )?;
+    let name = config
+        .build
+        .asset_name
+        .as_ref()
+        .map(|template| substitute(template, vars))
+        .unwrap_or(default_name);
+    if name.trim().is_empty() {
+        bail!("build.asset-name resolved to an empty file name");
+    }
+    if name.contains('/') || name.contains('\\') {
+        bail!("build.asset-name must be a file name, got {name}");
+    }
+    Ok(name)
+}
+
+fn asset_content_type(archive_format: ArchiveFormat, asset_name: &str) -> &'static str {
+    match archive_format {
+        ArchiveFormat::TarGz => "application/gzip",
+        ArchiveFormat::Zip => "application/zip",
+        ArchiveFormat::None if asset_name.ends_with(".zip") => "application/zip",
+        ArchiveFormat::None if asset_name.ends_with(".tar.gz") || asset_name.ends_with(".tgz") => {
+            "application/gzip"
+        }
+        ArchiveFormat::None if asset_name.ends_with(".dmg") => "application/x-apple-diskimage",
+        ArchiveFormat::None => "application/octet-stream",
+    }
+}
+
+fn make_tar_gz_archive(artifact_path: &Path, archive_path: &Path) -> Result<()> {
+    let archive_abs = absolute_output_path(archive_path)?;
+    let artifact_dir = artifact_path.parent().unwrap_or_else(|| Path::new("."));
+    let artifact_file = artifact_file_name(artifact_path)?;
+
+    run_cmd(
+        "build",
+        Some(artifact_dir),
+        "tar",
+        &["czf", &archive_abs.to_string_lossy(), &artifact_file],
+    )?;
+    Ok(())
+}
+
+fn make_zip_archive(artifact_path: &Path, archive_path: &Path) -> Result<()> {
+    let archive_abs = absolute_output_path(archive_path)?;
+    if archive_abs.exists() {
+        std::fs::remove_file(&archive_abs)?;
+    }
+
+    let artifact_path_str = artifact_path.to_string_lossy().to_string();
+    let archive_path_str = archive_abs.to_string_lossy().to_string();
+    if command_exists("ditto") {
+        run_cmd(
+            "build",
+            None,
+            "ditto",
+            &[
+                "-c",
+                "-k",
+                "--keepParent",
+                &artifact_path_str,
+                &archive_path_str,
+            ],
+        )?;
+        return Ok(());
+    }
+
+    if command_exists("zip") {
+        let artifact_dir = artifact_path.parent().unwrap_or_else(|| Path::new("."));
+        let artifact_file = artifact_file_name(artifact_path)?;
+        run_cmd(
+            "build",
+            Some(artifact_dir),
+            "zip",
+            &["-qry", &archive_path_str, &artifact_file],
+        )?;
+        return Ok(());
+    }
+
+    bail!("archive-format = \"zip\" requires either ditto or zip on PATH")
+}
+
+fn prepare_release_asset(
+    archive_format: ArchiveFormat,
+    artifact_path: &Path,
+    archive_path: &Path,
+) -> Result<PathBuf> {
+    match archive_format {
+        ArchiveFormat::TarGz => {
+            make_tar_gz_archive(artifact_path, archive_path)?;
+            Ok(archive_path.to_path_buf())
+        }
+        ArchiveFormat::Zip => {
+            make_zip_archive(artifact_path, archive_path)?;
+            Ok(archive_path.to_path_buf())
+        }
+        ArchiveFormat::None => {
+            if artifact_path.is_dir() {
+                bail!(
+                    "archive-format = \"none\" cannot upload directory {}; use archive-format = \"zip\"",
+                    artifact_path.display()
+                );
+            }
+            Ok(artifact_path.to_path_buf())
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum XcodeContainer {
+    Project(String),
+    Workspace(String),
+}
+
+impl XcodeContainer {
+    fn args(&self) -> Vec<String> {
+        match self {
+            Self::Project(path) => vec!["-project".to_string(), path.clone()],
+            Self::Workspace(path) => vec!["-workspace".to_string(), path.clone()],
+        }
+    }
+
+    fn path(&self) -> &str {
+        match self {
+            Self::Project(path) | Self::Workspace(path) => path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct MacBuildSettings {
+    app_name: Option<String>,
+    team_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedMacApp {
+    container: XcodeContainer,
+    scheme: String,
+    build_settings: MacBuildSettings,
+}
+
+impl ResolvedMacApp {
+    fn app_name<'a>(&'a self, mac_app: &'a MacApp) -> Option<&'a str> {
+        mac_app
+            .app_name
+            .as_deref()
+            .or(self.build_settings.app_name.as_deref())
+    }
+
+    fn team_id(&self, mac_app: &MacApp) -> Option<String> {
+        mac_app
+            .team_id
+            .clone()
+            .or_else(|| self.build_settings.team_id.clone())
+            .or_else(|| std::env::var(mac_app.team_id_env()).ok())
+    }
+}
+
+struct MacAppRelease<'a> {
+    config: &'a Config,
+    mac_app: &'a MacApp,
+    version: &'a str,
+    staging: PathBuf,
+}
+
+impl<'a> MacAppRelease<'a> {
+    fn new(config: &'a Config, version: &'a str) -> Option<Self> {
+        let mac_app = config.mac_app.as_ref()?;
+        Some(Self {
+            config,
+            mac_app,
+            version,
+            staging: PathBuf::from("target/release-staging/mac-app"),
+        })
+    }
+
+    fn resolve(&self) -> Result<ResolvedMacApp> {
+        let container = self.resolve_container()?;
+        let (scheme, build_settings) = self.resolve_scheme_and_settings(&container)?;
+        Ok(ResolvedMacApp {
+            container,
+            scheme,
+            build_settings,
+        })
+    }
+
+    fn resolve_container(&self) -> Result<XcodeContainer> {
+        match (
+            self.non_empty_config_value(self.mac_app.project.as_deref()),
+            self.non_empty_config_value(self.mac_app.workspace.as_deref()),
+        ) {
+            (Some(project), None) => Ok(XcodeContainer::Project(project.to_string())),
+            (None, Some(workspace)) => Ok(XcodeContainer::Workspace(workspace.to_string())),
+            (None, None) => Self::discover_container(),
+            (Some(_), Some(_)) => bail!("mac-app requires at most one of project or workspace"),
+        }
+    }
+
+    fn resolve_scheme_and_settings(
+        &self,
+        container: &XcodeContainer,
+    ) -> Result<(String, MacBuildSettings)> {
+        if let Some(scheme) = self.non_empty_config_value(self.mac_app.scheme.as_deref()) {
+            let build_settings = self
+                .mac_build_settings(container, scheme)
+                .unwrap_or_else(|err| {
+                    eprintln!(
+                        "[xcodebuild] Warning: could not read build settings for scheme {scheme}: {err}"
+                    );
+                    None
+                })
+                .unwrap_or_default();
+            return Ok((scheme.to_string(), build_settings));
+        }
+
+        let schemes = self.xcode_schemes(container)?;
+        if schemes.is_empty() {
+            bail!(
+                "no Xcode schemes found in {}; set mac-app.scheme",
+                container.path()
+            );
+        }
+
+        let mut mac_schemes = Vec::new();
+        for scheme in &schemes {
+            match self.mac_build_settings(container, scheme) {
+                Ok(Some(build_settings)) => mac_schemes.push((scheme.clone(), build_settings)),
+                Ok(None) => {}
+                Err(err) => eprintln!(
+                    "[xcodebuild] Warning: skipping scheme {scheme}; could not read macOS app build settings: {err}"
+                ),
+            }
+        }
+
+        match mac_schemes.as_slice() {
+            [(scheme, build_settings)] => Ok((scheme.clone(), build_settings.clone())),
+            [] => bail!(
+                "could not derive a macOS app scheme from {}; set mac-app.scheme",
+                container.path()
+            ),
+            matches => bail!(
+                "multiple macOS app schemes found in {} ({}); set mac-app.scheme",
+                container.path(),
+                matches
+                    .iter()
+                    .map(|(scheme, _)| scheme.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    fn build_artifacts(&self) -> Result<Vec<BuiltArchive>> {
+        let mut archives = Vec::new();
+        for target in &self.config.build.targets {
+            archives.push(self.build_target(target)?);
+        }
+        Ok(archives)
+    }
+
+    fn build_target(&self, target: &str) -> Result<BuiltArchive> {
+        let resolved = self.resolve()?;
+        println!(
+            "[mac-app] Using {} scheme {}",
+            resolved.container.path(),
+            resolved.scheme
+        );
+
+        let target_staging = self.staging.join(Self::safe_path_component(target));
+        if target_staging.exists() {
+            std::fs::remove_dir_all(&target_staging)?;
+        }
+        std::fs::create_dir_all(&target_staging)?;
+
+        let archive_path = target_staging.join(format!(
+            "{}.xcarchive",
+            Self::safe_path_component(&resolved.scheme)
+        ));
+        let export_path = target_staging.join("export");
+        let export_options_path = target_staging.join("ExportOptions.plist");
+
+        self.archive(&resolved, &archive_path, target)?;
+        self.write_export_options(&resolved, &export_options_path)?;
+        self.export_archive(&archive_path, &export_path, &export_options_path)?;
+
+        let app_path = self.exported_app_path(&resolved, &export_path)?;
+        if self.mac_app.notarize {
+            self.notarize_and_staple(&resolved, &app_path, &target_staging)?;
+        }
+
+        let app_name = Self::app_name_from_path(&app_path)?;
+        let vars = &[
+            ("target", target),
+            ("binary", app_name.as_str()),
+            ("package", ""),
+            ("version", self.version),
+            ("app-name", app_name.as_str()),
+        ];
+        let archive_format = self.config.archive_format();
+        let asset_name = release_asset_name(
+            self.config,
+            &app_name,
+            self.version,
+            target,
+            vars,
+            &app_path,
+        )?;
+        let content_type = asset_content_type(archive_format, &asset_name);
+        let release_asset_path = PathBuf::from("target/release-staging").join(&asset_name);
+        let release_asset_path =
+            prepare_release_asset(archive_format, &app_path, &release_asset_path)?;
+
+        Ok(BuiltArchive {
+            binary: app_name,
+            target: target.to_string(),
+            asset_name,
+            archive_path: release_asset_path,
+            content_type,
+        })
+    }
+
+    fn archive(&self, resolved: &ResolvedMacApp, archive_path: &Path, target: &str) -> Result<()> {
+        let mut args = resolved.container.args();
+        args.extend([
+            "-scheme".to_string(),
+            resolved.scheme.clone(),
+            "-configuration".to_string(),
+            self.mac_app.configuration().to_string(),
+            "-destination".to_string(),
+            self.mac_app.destination().to_string(),
+            "-archivePath".to_string(),
+            archive_path.to_string_lossy().to_string(),
+            "archive".to_string(),
+        ]);
+        args.extend(Self::target_arch_args(target));
+        self.run_owned("xcodebuild", "xcodebuild", args)
+            .context("xcode archive failed")?;
+        Ok(())
+    }
+
+    fn export_archive(
+        &self,
+        archive_path: &Path,
+        export_path: &Path,
+        export_options_path: &Path,
+    ) -> Result<()> {
+        if export_path.exists() {
+            std::fs::remove_dir_all(export_path)?;
+        }
+        std::fs::create_dir_all(export_path)?;
+        let args = vec![
+            "-exportArchive".to_string(),
+            "-archivePath".to_string(),
+            archive_path.to_string_lossy().to_string(),
+            "-exportPath".to_string(),
+            export_path.to_string_lossy().to_string(),
+            "-exportOptionsPlist".to_string(),
+            export_options_path.to_string_lossy().to_string(),
+        ];
+        self.run_owned("xcodebuild", "xcodebuild", args)
+            .context("xcode export failed")?;
+        Ok(())
+    }
+
+    fn target_arch_args(target: &str) -> Vec<String> {
+        if target == "aarch64-apple-darwin" {
+            vec!["ARCHS=arm64".to_string(), "ONLY_ACTIVE_ARCH=NO".to_string()]
+        } else if target == "x86_64-apple-darwin" {
+            vec![
+                "ARCHS=x86_64".to_string(),
+                "ONLY_ACTIVE_ARCH=NO".to_string(),
+            ]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn non_empty_config_value<'b>(&self, value: Option<&'b str>) -> Option<&'b str> {
+        value.map(str::trim).filter(|value| !value.is_empty())
+    }
+
+    fn discover_container() -> Result<XcodeContainer> {
+        let (workspaces, projects) = Self::discover_xcode_container_paths(Path::new("."))?;
+        match (workspaces.as_slice(), projects.as_slice()) {
+            ([workspace], _) => Ok(XcodeContainer::Workspace(workspace.clone())),
+            ([], [project]) => Ok(XcodeContainer::Project(project.clone())),
+            ([], []) => bail!(
+                "could not find an .xcodeproj or .xcworkspace; set mac-app.project or mac-app.workspace"
+            ),
+            ([], projects) => bail!(
+                "multiple .xcodeproj files found ({}); set mac-app.project",
+                projects.join(", ")
+            ),
+            (workspaces, _) => bail!(
+                "multiple .xcworkspace files found ({}); set mac-app.workspace",
+                workspaces.join(", ")
+            ),
+        }
+    }
+
+    fn discover_xcode_container_paths(dir: &Path) -> Result<(Vec<String>, Vec<String>)> {
+        let mut workspaces = Vec::new();
+        let mut projects = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+                continue;
+            };
+            let Some(file_name) = path.file_name().and_then(|file_name| file_name.to_str()) else {
+                continue;
+            };
+            match extension {
+                "xcworkspace" => workspaces.push(file_name.to_string()),
+                "xcodeproj" => projects.push(file_name.to_string()),
+                _ => {}
+            }
+        }
+        workspaces.sort();
+        projects.sort();
+        Ok((workspaces, projects))
+    }
+
+    fn xcode_schemes(&self, container: &XcodeContainer) -> Result<Vec<String>> {
+        let mut args = container.args();
+        args.extend(["-list".to_string(), "-json".to_string()]);
+        let output = self.run_owned("xcodebuild", "xcodebuild", args)?;
+        Self::parse_xcode_schemes(&output)
+    }
+
+    fn parse_xcode_schemes(output: &str) -> Result<Vec<String>> {
+        let parsed: serde_json::Value = serde_json::from_str(output)
+            .context("failed to parse xcodebuild -list -json output")?;
+        let schemes = parsed
+            .get("project")
+            .or_else(|| parsed.get("workspace"))
+            .and_then(|container| container.get("schemes"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                anyhow::anyhow!("xcodebuild -list -json output did not include schemes")
+            })?;
+        Ok(schemes
+            .iter()
+            .filter_map(|scheme| scheme.as_str().map(str::to_string))
+            .collect())
+    }
+
+    fn mac_build_settings(
+        &self,
+        container: &XcodeContainer,
+        scheme: &str,
+    ) -> Result<Option<MacBuildSettings>> {
+        let mut args = container.args();
+        args.extend([
+            "-scheme".to_string(),
+            scheme.to_string(),
+            "-configuration".to_string(),
+            self.mac_app.configuration().to_string(),
+            "-destination".to_string(),
+            self.mac_app.destination().to_string(),
+            "-showBuildSettings".to_string(),
+            "-json".to_string(),
+        ]);
+        let output = self.run_owned("xcodebuild", "xcodebuild", args)?;
+        Self::build_settings_from_xcode_json(&output)
+    }
+
+    fn build_settings_from_xcode_json(output: &str) -> Result<Option<MacBuildSettings>> {
+        let parsed: serde_json::Value = serde_json::from_str(output)
+            .context("failed to parse xcodebuild -showBuildSettings -json output")?;
+        let Some(entries) = parsed.as_array() else {
+            return Ok(None);
+        };
+
+        for entry in entries {
+            let Some(settings) = entry
+                .get("buildSettings")
+                .and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            if !Self::is_macos_app_build_settings(settings) {
+                continue;
+            }
+
+            let app_name = Self::build_setting(settings, "FULL_PRODUCT_NAME")
+                .or_else(|| Self::build_setting(settings, "WRAPPER_NAME"))
+                .and_then(|name| name.strip_suffix(".app").or(Some(name)))
+                .or_else(|| Self::build_setting(settings, "PRODUCT_NAME"))
+                .map(str::to_string);
+            let team_id = Self::build_setting(settings, "DEVELOPMENT_TEAM")
+                .filter(|team_id| !team_id.is_empty())
+                .map(str::to_string);
+            return Ok(Some(MacBuildSettings { app_name, team_id }));
+        }
+
+        Ok(None)
+    }
+
+    fn is_macos_app_build_settings(settings: &serde_json::Map<String, serde_json::Value>) -> bool {
+        let full_product_name = Self::build_setting(settings, "FULL_PRODUCT_NAME").unwrap_or("");
+        let wrapper_name = Self::build_setting(settings, "WRAPPER_NAME").unwrap_or("");
+        let wrapper_extension = Self::build_setting(settings, "WRAPPER_EXTENSION").unwrap_or("");
+        let is_app = full_product_name.ends_with(".app")
+            || wrapper_name.ends_with(".app")
+            || wrapper_extension == "app";
+        if !is_app {
+            return false;
+        }
+
+        let platform_name = Self::build_setting(settings, "PLATFORM_NAME").unwrap_or("");
+        let sdkroot = Self::build_setting(settings, "SDKROOT").unwrap_or("");
+        let supported_platforms =
+            Self::build_setting(settings, "SUPPORTED_PLATFORMS").unwrap_or("");
+        platform_name == "macosx"
+            || sdkroot == "macosx"
+            || sdkroot.contains("MacOSX")
+            || supported_platforms.split_whitespace().eq(["macosx"])
+    }
+
+    fn build_setting<'b>(
+        settings: &'b serde_json::Map<String, serde_json::Value>,
+        key: &str,
+    ) -> Option<&'b str> {
+        settings.get(key)?.as_str().map(str::trim)
+    }
+
+    fn write_export_options(&self, resolved: &ResolvedMacApp, path: &Path) -> Result<()> {
+        let mut plist = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n",
+        );
+        Self::push_plist_string(&mut plist, "method", self.mac_app.export_method());
+        Self::push_plist_string(&mut plist, "signingStyle", "automatic");
+        if let Some(team_id) = resolved.team_id(self.mac_app) {
+            Self::push_plist_string(&mut plist, "teamID", &team_id);
+        }
+        plist.push_str("\t<key>stripSwiftSymbols</key>\n\t<true/>\n");
+        plist.push_str("</dict>\n</plist>\n");
+        std::fs::write(path, plist)?;
+        Ok(())
+    }
+
+    fn exported_app_path(&self, resolved: &ResolvedMacApp, export_path: &Path) -> Result<PathBuf> {
+        if let Some(app_name) = resolved.app_name(self.mac_app) {
+            let bundle_name = if app_name.ends_with(".app") {
+                app_name.to_string()
+            } else {
+                format!("{app_name}.app")
+            };
+            let path = export_path.join(bundle_name);
+            if path.exists() {
+                return Ok(path);
+            }
+            bail!("exported app not found at {}", path.display());
+        }
+
+        let mut apps = Vec::new();
+        for entry in std::fs::read_dir(export_path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("app") {
+                apps.push(path);
+            }
+        }
+
+        match apps.as_slice() {
+            [path] => Ok(path.clone()),
+            [] => bail!(
+                "xcode export did not produce an .app in {}",
+                export_path.display()
+            ),
+            _ => bail!("xcode export produced multiple .apps; set mac-app.app-name"),
+        }
+    }
+
+    fn notarize_and_staple(
+        &self,
+        resolved: &ResolvedMacApp,
+        app_path: &Path,
+        target_staging: &Path,
+    ) -> Result<()> {
+        let zip_path = target_staging.join("notary.zip");
+        make_zip_archive(app_path, &zip_path)?;
+        self.submit_for_notarization(resolved, &zip_path)?;
+
+        let app_path_string = app_path.to_string_lossy().to_string();
+        self.run_owned(
+            "notary",
+            "xcrun",
+            vec![
+                "stapler".to_string(),
+                "staple".to_string(),
+                app_path_string.clone(),
+            ],
+        )?;
+        self.run_owned(
+            "notary",
+            "xcrun",
+            vec![
+                "stapler".to_string(),
+                "validate".to_string(),
+                app_path_string,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn submit_for_notarization(&self, resolved: &ResolvedMacApp, zip_path: &Path) -> Result<()> {
+        let zip_path_string = zip_path.to_string_lossy().to_string();
+        if let Some(profile) = &self.mac_app.notary_profile {
+            return self
+                .run_owned(
+                    "notary",
+                    "xcrun",
+                    vec![
+                        "notarytool".to_string(),
+                        "submit".to_string(),
+                        zip_path_string,
+                        "--wait".to_string(),
+                        "--keychain-profile".to_string(),
+                        profile.clone(),
+                    ],
+                )
+                .map(|_| ());
+        }
+
+        let apple_id = std::env::var(self.mac_app.apple_id_env()).with_context(|| {
+            format!(
+                "{} environment variable not set",
+                self.mac_app.apple_id_env()
+            )
+        })?;
+        let password = std::env::var(self.mac_app.password_env()).with_context(|| {
+            format!(
+                "{} environment variable not set",
+                self.mac_app.password_env()
+            )
+        })?;
+        let team_id = resolved.team_id(self.mac_app).ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not derive team ID from Xcode build settings; set mac-app.team-id or {}",
+                self.mac_app.team_id_env()
+            )
+        })?;
+
+        let args = vec![
+            "notarytool".to_string(),
+            "submit".to_string(),
+            zip_path_string,
+            "--wait".to_string(),
+            "--apple-id".to_string(),
+            apple_id,
+            "--password".to_string(),
+            password,
+            "--team-id".to_string(),
+            team_id,
+        ];
+        let display = args
+            .iter()
+            .enumerate()
+            .map(|(index, arg)| {
+                if index > 0 && args[index - 1] == "--password" {
+                    "<redacted>".to_string()
+                } else {
+                    arg.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.run_owned_with_display("notary", "xcrun", args, &display)
+            .map(|_| ())
+    }
+
+    fn run_owned(&self, label: &str, cmd: &str, args: Vec<String>) -> Result<String> {
+        let display = args.join(" ");
+        self.run_owned_with_display(label, cmd, args, &display)
+    }
+
+    fn run_owned_with_display(
+        &self,
+        label: &str,
+        cmd: &str,
+        args: Vec<String>,
+        display: &str,
+    ) -> Result<String> {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_cmd_with_display(label, None, cmd, &refs, display)
+    }
+
+    fn app_name_from_path(app_path: &Path) -> Result<String> {
+        let file_name = artifact_file_name(app_path)?;
+        Ok(file_name
+            .strip_suffix(".app")
+            .unwrap_or(&file_name)
+            .to_string())
+    }
+
+    fn safe_path_component(value: &str) -> String {
+        value
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+
+    fn push_plist_string(plist: &mut String, key: &str, value: &str) {
+        plist.push_str("\t<key>");
+        plist.push_str(&Self::xml_escape(key));
+        plist.push_str("</key>\n\t<string>");
+        plist.push_str(&Self::xml_escape(value));
+        plist.push_str("</string>\n");
+    }
+
+    fn xml_escape(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('\"', "&quot;")
+            .replace('\'', "&apos;")
+    }
 }
 
 fn build_artifacts(
@@ -737,6 +1529,10 @@ fn build_artifacts(
     version: &str,
     cargo_package: Option<&CargoPackageSelection>,
 ) -> Result<Vec<BuiltArchive>> {
+    if let Some(mac_app_release) = MacAppRelease::new(config, version) {
+        return mac_app_release.build_artifacts();
+    }
+
     let binaries = config.project.release_binaries();
     let staging = PathBuf::from("target/release-staging");
     std::fs::create_dir_all(&staging)?;
@@ -861,34 +1657,20 @@ fn build_artifacts(
                 continue;
             }
 
-            let archive_name = format!("{binary}-{version}-{target}.tar.gz");
-            let archive_path = staging.join(&archive_name);
-
-            let artifact_dir = artifact_path.parent().unwrap_or_else(|| Path::new("."));
-            let artifact_file = artifact_path
-                .file_name()
-                .ok_or_else(|| anyhow::anyhow!("artifact has no filename"))?
-                .to_string_lossy();
-
-            run_cmd(
-                "build",
-                Some(artifact_dir),
-                "tar",
-                &[
-                    "czf",
-                    &archive_path
-                        .canonicalize()
-                        .unwrap_or(std::fs::canonicalize(&staging)?.join(&archive_name))
-                        .to_string_lossy(),
-                    &artifact_file,
-                ],
-            )?;
+            let asset_name =
+                release_asset_name(config, binary, version, target, vars, &artifact_path)?;
+            let archive_format = config.archive_format();
+            let content_type = asset_content_type(archive_format, &asset_name);
+            let archive_path = staging.join(&asset_name);
+            let archive_path =
+                prepare_release_asset(archive_format, &artifact_path, &archive_path)?;
 
             archives.push(BuiltArchive {
                 binary: binary.to_string(),
                 target: target.clone(),
-                asset_name: archive_name,
+                asset_name,
                 archive_path,
+                content_type,
             });
         }
     }
@@ -1009,6 +1791,66 @@ fn command_exists(cmd: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+fn validate_release_asset_compatibility(config: &Config, selected: &[&str]) -> Result<()> {
+    if config.mac_app.is_some() && selected.iter().any(|ch| *ch != "git") {
+        bail!("mac-app releases currently support the git channel only");
+    }
+
+    let needs_default_tar_gz_assets = selected
+        .iter()
+        .any(|ch| matches!(*ch, "homebrew" | "curl" | "nix"));
+    if needs_default_tar_gz_assets
+        && (config.archive_format() != ArchiveFormat::TarGz || config.build.asset_name.is_some())
+    {
+        bail!(
+            "homebrew, curl, and nix channels require default tar-gz asset names; use only the git channel for custom build.archive-format or build.asset-name"
+        );
+    }
+    Ok(())
+}
+
+fn preflight_mac_app(config: &Config) -> Result<()> {
+    let Some(mac_app) = config.mac_app.as_ref() else {
+        return Ok(());
+    };
+
+    let mut missing = Vec::new();
+    if !command_exists("xcodebuild") {
+        missing.push("xcodebuild command is required for mac-app releases".to_string());
+    }
+    if config.archive_format() == ArchiveFormat::Zip
+        && !command_exists("ditto")
+        && !command_exists("zip")
+    {
+        missing.push("ditto or zip command is required for mac-app zip releases".to_string());
+    }
+    if mac_app.notarize {
+        if !command_exists("xcrun") {
+            missing.push("xcrun command is required for mac-app notarization".to_string());
+        }
+        if mac_app.notary_profile.is_none() {
+            if std::env::var(mac_app.apple_id_env()).is_err() {
+                missing.push(format!(
+                    "{} env var is required for mac-app notarization",
+                    mac_app.apple_id_env()
+                ));
+            }
+            if std::env::var(mac_app.password_env()).is_err() {
+                missing.push(format!(
+                    "{} env var is required for mac-app notarization",
+                    mac_app.password_env()
+                ));
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        bail!("preflight check failed:\n  - {}", missing.join("\n  - "));
+    }
+
+    Ok(())
+}
+
 fn preflight(git: &GitContext, selected: &[&str], auto_tag_enabled: bool) -> Result<()> {
     let mut missing = Vec::new();
 
@@ -1090,6 +1932,8 @@ pub fn release(
     }
 
     let auto_tag_enabled = config.project.auto_tag && selected.contains(&"git");
+    validate_release_asset_compatibility(config, &selected)?;
+    preflight_mac_app(config)?;
     preflight(&git, &selected, auto_tag_enabled)?;
     let cargo_package = CargoPackageSelection::resolve(config, &selected)?;
 
@@ -1280,7 +2124,7 @@ fn release_git(
             &upload_url,
             &archive.archive_path,
             &archive.asset_name,
-            "application/gzip",
+            archive.content_type,
         )?;
     }
     println!("[git] Created release v{version}");
@@ -1714,6 +2558,185 @@ mod tests {
         assert_eq!(result, "a and a and b");
     }
 
+    // --- release asset tests ---
+
+    #[test]
+    fn default_asset_name_uses_archive_format() {
+        let artifact = Path::new("dist/Tool.zip");
+        assert_eq!(
+            default_asset_name(ArchiveFormat::TarGz, "tool", "1.0.0", "target", artifact).unwrap(),
+            "tool-1.0.0-target.tar.gz"
+        );
+        assert_eq!(
+            default_asset_name(ArchiveFormat::Zip, "tool", "1.0.0", "target", artifact).unwrap(),
+            "tool-1.0.0-target.zip"
+        );
+        assert_eq!(
+            default_asset_name(ArchiveFormat::None, "tool", "1.0.0", "target", artifact).unwrap(),
+            "Tool.zip"
+        );
+    }
+
+    #[test]
+    fn release_asset_name_applies_template() {
+        let config = Config::parse(
+            r#"
+[project]
+name = "Teletype"
+repo = "owner/repo"
+
+[build]
+command = "scripts/release-mac.sh {version} {target}"
+artifact = "build/releases/Teletype.app"
+archive-format = "zip"
+asset-name = "Teletype-{version}-mac-arm64.zip"
+targets = ["aarch64-apple-darwin"]
+"#,
+        )
+        .unwrap();
+        let vars = &[
+            ("target", "aarch64-apple-darwin"),
+            ("binary", "Teletype"),
+            ("package", ""),
+            ("version", "1.2.3"),
+        ];
+        let name = release_asset_name(
+            &config,
+            "Teletype",
+            "1.2.3",
+            "aarch64-apple-darwin",
+            vars,
+            Path::new("build/releases/Teletype.app"),
+        )
+        .unwrap();
+        assert_eq!(name, "Teletype-1.2.3-mac-arm64.zip");
+    }
+
+    #[test]
+    fn asset_content_type_matches_asset_kind() {
+        assert_eq!(
+            asset_content_type(ArchiveFormat::TarGz, "ignored.zip"),
+            "application/gzip"
+        );
+        assert_eq!(
+            asset_content_type(ArchiveFormat::Zip, "Tool.zip"),
+            "application/zip"
+        );
+        assert_eq!(
+            asset_content_type(ArchiveFormat::None, "Tool.dmg"),
+            "application/x-apple-diskimage"
+        );
+    }
+
+    #[test]
+    fn mac_app_target_arch_args_match_common_darwin_targets() {
+        assert_eq!(
+            MacAppRelease::target_arch_args("aarch64-apple-darwin"),
+            vec!["ARCHS=arm64".to_string(), "ONLY_ACTIVE_ARCH=NO".to_string()]
+        );
+        assert_eq!(
+            MacAppRelease::target_arch_args("x86_64-apple-darwin"),
+            vec![
+                "ARCHS=x86_64".to_string(),
+                "ONLY_ACTIVE_ARCH=NO".to_string()
+            ]
+        );
+        assert!(MacAppRelease::target_arch_args("macos").is_empty());
+    }
+
+    #[test]
+    fn parse_xcode_schemes_reads_project_json() {
+        let schemes = MacAppRelease::parse_xcode_schemes(
+            r#"{"project":{"name":"App","schemes":["App","AppMac"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(schemes, vec!["App", "AppMac"]);
+    }
+
+    #[test]
+    fn mac_build_settings_derive_app_name_and_team_id() {
+        let settings = MacAppRelease::build_settings_from_xcode_json(
+            r#"
+[
+  {
+    "target": "Teletype",
+    "buildSettings": {
+      "FULL_PRODUCT_NAME": "Teletype.app",
+      "PLATFORM_NAME": "macosx",
+      "DEVELOPMENT_TEAM": "ABCDE12345"
+    }
+  }
+]
+"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(settings.app_name.as_deref(), Some("Teletype"));
+        assert_eq!(settings.team_id.as_deref(), Some("ABCDE12345"));
+    }
+
+    #[test]
+    fn custom_zip_assets_are_valid_for_git_only() {
+        let config = Config::parse(
+            r#"
+[project]
+name = "Teletype"
+repo = "owner/repo"
+
+[build]
+command = "scripts/release-mac.sh"
+artifact = "build/releases/Teletype.app"
+archive-format = "zip"
+asset-name = "Teletype-{version}-mac-arm64.zip"
+targets = ["aarch64-apple-darwin"]
+"#,
+        )
+        .unwrap();
+        validate_release_asset_compatibility(&config, &["git"]).unwrap();
+    }
+
+    #[test]
+    fn custom_zip_assets_are_rejected_for_dependent_channels() {
+        let config = Config::parse(
+            r#"
+[project]
+name = "Teletype"
+repo = "owner/repo"
+
+[build]
+command = "scripts/release-mac.sh"
+artifact = "build/releases/Teletype.app"
+archive-format = "zip"
+targets = ["aarch64-apple-darwin"]
+"#,
+        )
+        .unwrap();
+        let err = validate_release_asset_compatibility(&config, &["git", "nix"]).unwrap_err();
+        assert!(err.to_string().contains("default tar-gz asset names"));
+    }
+
+    #[test]
+    fn mac_app_releases_are_git_only() {
+        let config = Config::parse(
+            r#"
+[project]
+name = "Teletype"
+repo = "owner/repo"
+
+[build]
+targets = ["aarch64-apple-darwin"]
+
+[mac-app]
+project = "Termsy.xcodeproj"
+scheme = "TermsyMac"
+notarize = false
+"#,
+        )
+        .unwrap();
+        let err = validate_release_asset_compatibility(&config, &["git", "cargo"]).unwrap_err();
+        assert!(err.to_string().contains("git channel only"));
+    }
+
     // --- to_pascal_case tests ---
 
     #[test]
@@ -1831,6 +2854,7 @@ mod tests {
             target: "x86_64-unknown-linux-gnu".to_string(),
             asset_name: "unused.tar.gz".to_string(),
             archive_path: PathBuf::from("unused"),
+            content_type: "application/gzip",
         }];
         let err = homebrew_macos_shas(&archives, "tool").unwrap_err();
         assert!(err.to_string().contains("aarch64-apple-darwin"));
@@ -1843,6 +2867,7 @@ mod tests {
             target: "aarch64-apple-darwin".to_string(),
             asset_name: "unused.tar.gz".to_string(),
             archive_path: PathBuf::from("unused"),
+            content_type: "application/gzip",
         }];
         let err = homebrew_macos_shas(&archives, "tool").unwrap_err();
         assert!(err.to_string().contains("x86_64-apple-darwin"));
