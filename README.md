@@ -40,7 +40,7 @@ Download a prebuilt binary from the [releases page](https://github.com/nakajima/
 # Generate a config file
 releasor2000 init
 
-# Edit releasor2000.toml to set your repo and enable channels
+# Review the generated config and enable any additional channels
 $EDITOR releasor2000.toml
 
 # Optional: enable [project].auto-tag in releasor2000.toml
@@ -69,7 +69,7 @@ Use `releasor2000 validate` to check your config without releasing.
 
 ## Configuration
 
-`releasor2000 init` generates a `releasor2000.toml`:
+`releasor2000 init` generates a `releasor2000.toml`. When `.git/config` contains an `origin` remote, it derives `project.repo` and the git host settings from that URL. `github.com` is treated as GitHub; other network hosts are configured as Gitea.
 
 ```toml
 [project]

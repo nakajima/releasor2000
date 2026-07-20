@@ -45,11 +45,16 @@ fn main() -> Result<()> {
             if cli.config.exists() {
                 bail!("{} already exists", cli.config.display());
             }
-            let name = std::env::current_dir()?
+            let current_dir = std::env::current_dir()?;
+            let name = current_dir
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "myproject".to_string());
-            std::fs::write(&cli.config, config::generate_template(&name))?;
+            let git_info = config::GitInfo::from_config(&current_dir.join(".git/config"));
+            std::fs::write(
+                &cli.config,
+                config::generate_template(&name, git_info.as_ref()),
+            )?;
             println!("Created {}", cli.config.display());
             return Ok(());
         }

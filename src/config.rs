@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::Path;
+use std::process::Command;
 use toml::Value;
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +65,136 @@ pub struct Git {
     pub api_base_url: Option<String>,
     #[serde(alias = "token_env")]
     pub token_env: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct GitInfo {
+    repo: String,
+    r#type: GitType,
+    base_url: String,
+}
+
+impl GitInfo {
+    pub fn from_config(path: &Path) -> Option<Self> {
+        if !path.is_file() {
+            return None;
+        }
+
+        let output = Command::new("git")
+            .arg("config")
+            .arg("--file")
+            .arg(path)
+            .arg("--get")
+            .arg("remote.origin.url")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let remote_url = String::from_utf8(output.stdout).ok()?;
+        Self::from_remote_url(remote_url.trim())
+    }
+
+    fn from_remote_url(remote_url: &str) -> Option<Self> {
+        let remote_url = remote_url.trim().trim_end_matches('/');
+        let (web_scheme, web_authority, host, path) =
+            if let Some((raw_scheme, remainder)) = remote_url.split_once("://") {
+                let scheme = raw_scheme.to_ascii_lowercase();
+                if !matches!(scheme.as_str(), "http" | "https" | "ssh" | "git") {
+                    return None;
+                }
+                let (raw_authority, path) = remainder.split_once('/')?;
+                let authority = raw_authority.rsplit('@').next()?.trim();
+                if authority.is_empty() {
+                    return None;
+                }
+                let host = if let Some(bracketed) = authority.strip_prefix('[') {
+                    bracketed.split_once(']')?.0
+                } else {
+                    authority.split(':').next()?
+                };
+                if host.is_empty() {
+                    return None;
+                }
+
+                let is_web_scheme = matches!(scheme.as_str(), "http" | "https");
+                let web_scheme = if is_web_scheme {
+                    scheme
+                } else {
+                    "https".to_string()
+                };
+                let web_authority = if is_web_scheme {
+                    authority.to_string()
+                } else if host.contains(':') {
+                    format!("[{host}]")
+                } else {
+                    host.to_string()
+                };
+
+                (web_scheme, web_authority, host.to_string(), path)
+            } else {
+                let (raw_authority, path) = remote_url.split_once(':')?;
+                if raw_authority.contains('/') || raw_authority.contains('\\') {
+                    return None;
+                }
+                let host = raw_authority.rsplit('@').next()?.trim();
+                if host.is_empty() {
+                    return None;
+                }
+                (
+                    "https".to_string(),
+                    host.to_string(),
+                    host.to_string(),
+                    path,
+                )
+            };
+
+        let mut segments: Vec<&str> = path
+            .trim_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        let repo_segment = segments.pop()?;
+        let repo_name = repo_segment.strip_suffix(".git").unwrap_or(repo_segment);
+        let owner = segments.pop()?;
+        if repo_name.is_empty()
+            || [owner, repo_name].iter().any(|value| {
+                value.chars().any(|character| {
+                    character.is_whitespace()
+                        || character.is_control()
+                        || matches!(character, '"' | '\\' | '#' | '?')
+                })
+            })
+        {
+            return None;
+        }
+
+        let mut base_url = format!("{web_scheme}://{web_authority}");
+        if !segments.is_empty() {
+            base_url.push('/');
+            base_url.push_str(&segments.join("/"));
+        }
+        if base_url.chars().any(|character| {
+            character.is_whitespace()
+                || character.is_control()
+                || matches!(character, '"' | '\\' | '#' | '?')
+        }) {
+            return None;
+        }
+
+        let r#type = if host.eq_ignore_ascii_case("github.com") {
+            GitType::Github
+        } else {
+            GitType::Gitea
+        };
+
+        Some(Self {
+            repo: format!("{owner}/{repo_name}"),
+            r#type,
+            base_url,
+        })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -181,7 +312,24 @@ impl Git {
     }
 }
 
-pub fn generate_template(project_name: &str) -> String {
+pub fn generate_template(project_name: &str, git_info: Option<&GitInfo>) -> String {
+    let default_repo = format!("owner/{project_name}");
+    let repo = git_info
+        .map(|info| info.repo.as_str())
+        .unwrap_or(&default_repo);
+    let git_settings = match git_info {
+        Some(info) if info.r#type == GitType::Gitea => format!(
+            "type = \"gitea\"\nbase-url = \"{}\"\n# api-base-url = \"{}/api/v1\"  # defaults from type/base-url\n# token-env = \"GITEA_TOKEN\"       # defaults: GITHUB_TOKEN or GITEA_TOKEN\n",
+            info.base_url, info.base_url
+        ),
+        Some(info) if info.base_url != "https://github.com" => format!(
+            "# type = \"gitea\"                  # defaults to \"github\"\nbase-url = \"{}\"\n# api-base-url = \"https://api.github.com\"\n# token-env = \"GITHUB_TOKEN\"      # defaults: GITHUB_TOKEN or GITEA_TOKEN\n",
+            info.base_url
+        ),
+        _ => "# type = \"gitea\"                  # defaults to \"github\"\n# base-url = \"https://git.example.com\"\n# api-base-url = \"https://git.example.com/api/v1\"  # defaults from type/base-url\n# token-env = \"GITEA_TOKEN\"       # defaults: GITHUB_TOKEN or GITEA_TOKEN\n"
+            .to_string(),
+    };
+
     format!(
         r#"[project]
 name = "{project_name}"
@@ -189,7 +337,7 @@ name = "{project_name}"
 # binary = "{project_name}"  # defaults to project name
 # package = "{project_name}"  # optional workspace package override; auto-detected from binary when unique
 # binaries = ["{project_name}", "{project_name}-cli"]  # optional extra release assets
-repo = "owner/{project_name}"
+repo = "{repo}"
 # version-command = "git describe --tags --abbrev=0"
 
 [build]
@@ -203,11 +351,7 @@ targets = [
 ]
 
 [git]
-# type = "gitea"                  # defaults to "github"
-# base-url = "https://git.example.com"
-# api-base-url = "https://git.example.com/api/v1"  # defaults from type/base-url
-# token-env = "GITEA_TOKEN"       # defaults: GITHUB_TOKEN or GITEA_TOKEN
-
+{git_settings}
 [channels.git]
 enabled = true
 
@@ -863,17 +1007,50 @@ crate-name = "myapp"
     }
 
     #[test]
+    fn git_info_derives_github_repo_from_scp_remote() {
+        let info = GitInfo::from_remote_url("git@github.com:nakajima/releasor2000.git").unwrap();
+        assert_eq!(info.repo, "nakajima/releasor2000");
+        assert_eq!(info.r#type, GitType::Github);
+        assert_eq!(info.base_url, "https://github.com");
+    }
+
+    #[test]
+    fn git_info_derives_gitea_settings_from_https_remote() {
+        let info = GitInfo::from_remote_url("https://git.example.com/gitea/team/releasor2000.git")
+            .unwrap();
+        assert_eq!(info.repo, "team/releasor2000");
+        assert_eq!(info.r#type, GitType::Gitea);
+        assert_eq!(info.base_url, "https://git.example.com/gitea");
+    }
+
+    #[test]
+    fn git_info_ignores_local_remotes() {
+        assert!(GitInfo::from_remote_url("../releasor2000.git").is_none());
+    }
+
+    #[test]
     fn generate_template_parses_successfully() {
-        let template = generate_template("myapp");
+        let template = generate_template("myapp", None);
         Config::parse(&template).unwrap();
     }
 
     #[test]
     fn generate_template_interpolates_project_name() {
-        let template = generate_template("cool-tool");
+        let template = generate_template("cool-tool", None);
         let config = Config::parse(&template).unwrap();
         assert_eq!(config.project.name, "cool-tool");
         assert_eq!(config.project.repo, "owner/cool-tool");
+    }
+
+    #[test]
+    fn generate_template_uses_git_info() {
+        let info =
+            GitInfo::from_remote_url("ssh://git@git.example.com/team/cool-tool.git").unwrap();
+        let template = generate_template("cool-tool", Some(&info));
+        let config = Config::parse(&template).unwrap();
+        assert_eq!(config.project.repo, "team/cool-tool");
+        assert_eq!(config.git.r#type, GitType::Gitea);
+        assert_eq!(config.git.web_base_url(), "https://git.example.com");
     }
 
     #[test]
