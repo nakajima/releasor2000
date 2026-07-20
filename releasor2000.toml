@@ -19,13 +19,13 @@ targets = [
 [channels.git]
 enabled = true
 
-[channels.homebrew]
-tap = "nakajima/homebrew-tap"
-formula-name = "releasor2000"
+#[channels.homebrew]
+#tap = "nakajima/homebrew-tap"
+#formula-name = "releasor2000"
 
 # [channels.cargo]
 crate-name = "releasor2000"
 
 [channels.curl]
 
-[channels.nix]
+# [channels.nix]
