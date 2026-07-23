@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use toml::Value as TomlValue;
 
-use crate::config::{Config, GitType};
+use crate::config::{Config, GitType, Macos};
 
 // --- Shared infrastructure ---
 
@@ -84,6 +84,191 @@ fn run_cmd(label: &str, dir: Option<&Path>, cmd: &str, args: &[&str]) -> Result<
         bail!("[{label}] {cmd} failed: {stderr}");
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+impl Macos {
+    fn preflight_errors(&self) -> Vec<String> {
+        let mut missing = Vec::new();
+        let needs_codesign = self.codesign.is_some() || self.notarization.is_some();
+
+        if needs_codesign && !command_exists("codesign") {
+            missing.push(
+                "codesign command is required for macOS signing and notarization".to_string(),
+            );
+        }
+
+        if let Some(codesign) = &self.codesign {
+            if let Some(entitlements) = &codesign.entitlements {
+                if !entitlements.is_file() {
+                    missing.push(format!(
+                        "macos.codesign.entitlements file not found: {}",
+                        entitlements.display()
+                    ));
+                }
+            }
+        }
+
+        if self.notarization.is_some() {
+            if !command_exists("ditto") {
+                missing.push("ditto command is required for macOS notarization".to_string());
+            }
+            if !command_exists("xcrun") {
+                missing.push("xcrun command is required for macOS notarization".to_string());
+            } else if !Command::new("xcrun")
+                .args(["--find", "notarytool"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+            {
+                missing.push(
+                    "notarytool is required for macOS notarization; install Xcode 13 or later"
+                        .to_string(),
+                );
+            }
+        }
+
+        missing
+    }
+
+    fn process_artifact(
+        &self,
+        artifact_path: &Path,
+        staging: &Path,
+        archive_stem: &str,
+    ) -> Result<()> {
+        if let Some(codesign) = &self.codesign {
+            let mut args = vec![
+                "--force".to_string(),
+                "--sign".to_string(),
+                codesign.identity.clone(),
+                "--options".to_string(),
+                "runtime".to_string(),
+                "--timestamp".to_string(),
+            ];
+            if let Some(entitlements) = &codesign.entitlements {
+                args.push("--entitlements".to_string());
+                args.push(entitlements.to_string_lossy().into_owned());
+            }
+            args.push(artifact_path.to_string_lossy().into_owned());
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            run_cmd("codesign", None, "codesign", &args)?;
+        }
+
+        if self.codesign.is_some() || self.notarization.is_some() {
+            self.verify_signature(artifact_path)?;
+        }
+
+        if self.notarization.is_some() {
+            self.notarize(artifact_path, staging, archive_stem)?;
+        }
+
+        Ok(())
+    }
+
+    fn verify_signature(&self, artifact_path: &Path) -> Result<()> {
+        let artifact_path = artifact_path.to_string_lossy();
+        run_cmd(
+            "codesign",
+            None,
+            "codesign",
+            &["--verify", "--strict", "--verbose=2", &artifact_path],
+        )?;
+        Ok(())
+    }
+
+    fn notarize(&self, artifact_path: &Path, staging: &Path, archive_stem: &str) -> Result<()> {
+        let notarization = self
+            .notarization
+            .as_ref()
+            .expect("notarization configuration required");
+        let zip_path = staging.join(format!("{archive_stem}.notarization.zip"));
+        if zip_path.exists() {
+            std::fs::remove_file(&zip_path).with_context(|| {
+                format!("[notarize] removing stale archive {}", zip_path.display())
+            })?;
+        }
+
+        let artifact_path_arg = artifact_path.to_string_lossy();
+        let zip_path_arg = zip_path.to_string_lossy();
+        run_cmd(
+            "notarize",
+            None,
+            "ditto",
+            &[
+                "-c",
+                "-k",
+                "--keepParent",
+                &artifact_path_arg,
+                &zip_path_arg,
+            ],
+        )?;
+
+        let result = self.submit_notarization(&zip_path, &notarization.keychain_profile);
+        match result {
+            Ok(()) => {
+                std::fs::remove_file(&zip_path).with_context(|| {
+                    format!(
+                        "[notarize] removing temporary archive {}",
+                        zip_path.display()
+                    )
+                })?;
+                Ok(())
+            }
+            Err(error) => Err(error.context(format!(
+                "[notarize] submission archive kept at {}",
+                zip_path.display()
+            ))),
+        }
+    }
+
+    fn submit_notarization(&self, zip_path: &Path, keychain_profile: &str) -> Result<()> {
+        let zip_path = zip_path.to_string_lossy();
+        let output = run_cmd(
+            "notarize",
+            None,
+            "xcrun",
+            &[
+                "notarytool",
+                "submit",
+                &zip_path,
+                "--keychain-profile",
+                keychain_profile,
+                "--wait",
+                "--output-format",
+                "json",
+            ],
+        )?;
+        let response: serde_json::Value = serde_json::from_str(&output)
+            .with_context(|| format!("[notarize] invalid notarytool response: {output}"))?;
+        let status = response["status"]
+            .as_str()
+            .context("[notarize] notarytool response did not include a status")?;
+        if status.eq_ignore_ascii_case("accepted") {
+            return Ok(());
+        }
+
+        let id = response["id"].as_str();
+        let log = id
+            .map(|id| {
+                run_cmd(
+                    "notarize",
+                    None,
+                    "xcrun",
+                    &[
+                        "notarytool",
+                        "log",
+                        id,
+                        "--keychain-profile",
+                        keychain_profile,
+                    ],
+                )
+                .unwrap_or_else(|error| format!("could not retrieve notarization log: {error}"))
+            })
+            .unwrap_or_else(|| "notarytool response did not include a submission ID".to_string());
+        bail!(
+            "[notarize] submission {} finished with status {status}:\n{log}",
+            id.unwrap_or("<unknown>")
+        )
+    }
 }
 
 fn git_api(
@@ -940,8 +1125,15 @@ fn build_artifacts(
                 continue;
             }
 
-            let archive_name = format!("{binary}-{version}-{target}.tar.gz");
+            let archive_stem = format!("{binary}-{version}-{target}");
+            let archive_name = format!("{archive_stem}.tar.gz");
             let archive_path = staging.join(&archive_name);
+
+            if target.contains("apple-darwin") {
+                config
+                    .macos
+                    .process_artifact(&artifact_path, &staging, &archive_stem)?;
+            }
 
             let artifact_dir = artifact_path.parent().unwrap_or_else(|| Path::new("."));
             let artifact_file = artifact_path
@@ -1088,7 +1280,12 @@ fn command_exists(cmd: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-fn preflight(git: &GitContext, selected: &[&str], auto_tag_enabled: bool) -> Result<()> {
+fn preflight(
+    config: &Config,
+    git: &GitContext,
+    selected: &[&str],
+    auto_tag_enabled: bool,
+) -> Result<()> {
     let mut missing = Vec::new();
 
     let needs_git_api = selected
@@ -1117,6 +1314,15 @@ fn preflight(git: &GitContext, selected: &[&str], auto_tag_enabled: bool) -> Res
 
     if auto_tag_enabled && !command_exists("git") {
         missing.push("git command is required when project.auto-tag is enabled".to_string());
+    }
+
+    if config
+        .build
+        .targets
+        .iter()
+        .any(|target| target.contains("apple-darwin"))
+    {
+        missing.extend(config.macos.preflight_errors());
     }
 
     let depends_on_git = selected
@@ -1169,7 +1375,7 @@ pub fn release(
     }
 
     let auto_tag_enabled = config.project.auto_tag && selected.contains(&"git");
-    preflight(&git, &selected, auto_tag_enabled)?;
+    preflight(config, &git, &selected, auto_tag_enabled)?;
     let cargo_package = CargoPackageSelection::resolve(config, &selected)?;
 
     let version = if auto_tag_enabled {
@@ -1781,6 +1987,7 @@ mod tests {
     use super::*;
 
     const GITHUB_BASE_URL: &str = "https://github.com";
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn github_git() -> GitContext {
         GitContext {
@@ -1791,6 +1998,22 @@ mod tests {
             accept_header: "application/vnd.github+json",
             is_github: true,
         }
+    }
+
+    fn preflight_config() -> Config {
+        Config::parse(
+            r#"
+[project]
+name = "tool"
+repo = "owner/tool"
+
+[build]
+command = "cargo build"
+artifact = "target/{target}/release/{binary}"
+targets = ["x86_64-unknown-linux-gnu"]
+"#,
+        )
+        .unwrap()
     }
 
     // --- substitute tests ---
@@ -2658,22 +2881,77 @@ targets = ["x86_64-apple-darwin"]
         assert!(flake.contains("https://git.example.com/owner/repo/releases/download"));
     }
 
+    // --- macOS signing tests ---
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codesign_process_survives_release_archive() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "releasor2000-codesign-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let artifact = temp_dir.join("tool");
+        std::fs::copy("/usr/bin/true", &artifact).unwrap();
+
+        let macos = Macos {
+            codesign: Some(crate::config::Codesign {
+                identity: "-".to_string(),
+                entitlements: None,
+            }),
+            notarization: None,
+        };
+        macos
+            .process_artifact(&artifact, &temp_dir, "tool-test-aarch64-apple-darwin")
+            .unwrap();
+
+        let archive = temp_dir.join("tool.tar.gz");
+        let archive_arg = archive.to_string_lossy();
+        run_cmd(
+            "test",
+            Some(&temp_dir),
+            "tar",
+            &["czf", &archive_arg, "tool"],
+        )
+        .unwrap();
+        let extracted_dir = temp_dir.join("extracted");
+        std::fs::create_dir(&extracted_dir).unwrap();
+        run_cmd("test", Some(&extracted_dir), "tar", &["xzf", &archive_arg]).unwrap();
+
+        let status = Command::new("codesign")
+            .args(["--verify", "--strict", "--verbose=2"])
+            .arg(extracted_dir.join("tool"))
+            .status()
+            .unwrap();
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+        assert!(status.success());
+    }
+
     // --- preflight tests ---
 
     #[test]
     fn preflight_ok_with_no_channels() {
+        let config = preflight_config();
         let git = github_git();
-        assert!(preflight(&git, &[], false).is_ok());
+        assert!(preflight(&config, &git, &[], false).is_ok());
     }
 
     #[test]
     fn preflight_requires_default_github_token() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
         // Remove GITHUB_TOKEN to ensure the check triggers
         let saved = std::env::var("GITHUB_TOKEN").ok();
         unsafe { std::env::remove_var("GITHUB_TOKEN") };
 
+        let config = preflight_config();
         let git = github_git();
-        let err = preflight(&git, &["git"], false).unwrap_err();
+        let err = preflight(&config, &git, &["git"], false).unwrap_err();
         assert!(err.to_string().contains("GITHUB_TOKEN"), "got: {err}");
 
         if let Some(val) = saved {
@@ -2683,6 +2961,7 @@ targets = ["x86_64-apple-darwin"]
 
     #[test]
     fn preflight_uses_git_token_env_name() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
         let saved = std::env::var("GITEA_TOKEN").ok();
         unsafe { std::env::remove_var("GITEA_TOKEN") };
         let git = GitContext {
@@ -2693,7 +2972,8 @@ targets = ["x86_64-apple-darwin"]
             accept_header: "application/json",
             is_github: false,
         };
-        let err = preflight(&git, &["git"], false).unwrap_err();
+        let config = preflight_config();
+        let err = preflight(&config, &git, &["git"], false).unwrap_err();
         assert!(err.to_string().contains("GITEA_TOKEN"), "got: {err}");
         if let Some(val) = saved {
             unsafe { std::env::set_var("GITEA_TOKEN", val) };
@@ -2702,6 +2982,7 @@ targets = ["x86_64-apple-darwin"]
 
     #[test]
     fn preflight_requires_nix() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
         // This test assumes `nix` is not installed in the test environment,
         // which is typical for CI. If nix IS installed, we can't test the
         // negative case, so skip.
@@ -2713,8 +2994,9 @@ targets = ["x86_64-apple-darwin"]
         let saved = std::env::var("GITHUB_TOKEN").ok();
         unsafe { std::env::set_var("GITHUB_TOKEN", "fake-token-for-test") };
 
+        let config = preflight_config();
         let git = github_git();
-        let err = preflight(&git, &["git", "nix"], false).unwrap_err();
+        let err = preflight(&config, &git, &["git", "nix"], false).unwrap_err();
         assert!(err.to_string().contains("nix command"), "got: {err}");
 
         match saved {
@@ -2725,13 +3007,15 @@ targets = ["x86_64-apple-darwin"]
 
     #[test]
     fn preflight_requires_git_for_dependent_channels() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
         // Ensure GITHUB_TOKEN is set so only the dependency check triggers
         let saved = std::env::var("GITHUB_TOKEN").ok();
         unsafe { std::env::set_var("GITHUB_TOKEN", "fake-token-for-test") };
 
+        let config = preflight_config();
         let git = github_git();
         for ch in &["homebrew", "curl", "nix"] {
-            let err = preflight(&git, &[*ch], false).unwrap_err();
+            let err = preflight(&config, &git, &[*ch], false).unwrap_err();
             assert!(
                 err.to_string().contains("git channel must be selected"),
                 "channel {ch}: got: {err}"
@@ -2749,8 +3033,9 @@ targets = ["x86_64-apple-darwin"]
         if command_exists("git") {
             return;
         }
+        let config = preflight_config();
         let git = github_git();
-        let err = preflight(&git, &["git"], true).unwrap_err();
+        let err = preflight(&config, &git, &["git"], true).unwrap_err();
         assert!(
             err.to_string().contains("git command is required"),
             "got: {err}"

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use toml::Value;
 
@@ -15,6 +15,8 @@ pub struct Config {
     pub forge: Option<toml::Value>,
     #[serde(default)]
     pub channels: Channels,
+    #[serde(default)]
+    pub macos: Macos,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +41,25 @@ pub struct Build {
     #[serde(alias = "pre_built_dir")]
     pub pre_built_dir: Option<String>,
     pub targets: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct Macos {
+    pub codesign: Option<Codesign>,
+    pub notarization: Option<Notarization>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Codesign {
+    pub identity: String,
+    pub entitlements: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Notarization {
+    #[serde(alias = "keychain_profile")]
+    pub keychain_profile: String,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -350,6 +371,13 @@ targets = [
     "aarch64-unknown-linux-gnu",
 ]
 
+# [macos.codesign]
+# identity = "Developer ID Application: Example Corp (TEAMID)"
+# entitlements = "entitlements.plist"  # optional
+
+# [macos.notarization]
+# keychain-profile = "releasor2000"  # created with: xcrun notarytool store-credentials releasor2000
+
 [git]
 {git_settings}
 [channels.git]
@@ -422,6 +450,11 @@ const KEY_MIGRATIONS: &[KeyMigration] = &[
         table_path: &["channels", "nix"],
         dashed: "flake-repo",
         underscored: "flake_repo",
+    },
+    KeyMigration {
+        table_path: &["macos", "notarization"],
+        dashed: "keychain-profile",
+        underscored: "keychain_profile",
     },
 ];
 
@@ -534,6 +567,26 @@ impl Config {
         }
         if self.build.targets.is_empty() {
             bail!("build.targets must not be empty");
+        }
+        if let Some(codesign) = &self.macos.codesign {
+            if codesign.identity.trim().is_empty() {
+                bail!("macos.codesign.identity must not be empty");
+            }
+            if codesign
+                .entitlements
+                .as_ref()
+                .is_some_and(|path| path.to_string_lossy().trim().is_empty())
+            {
+                bail!("macos.codesign.entitlements must not be empty");
+            }
+        }
+        if self
+            .macos
+            .notarization
+            .as_ref()
+            .is_some_and(|notarization| notarization.keychain_profile.trim().is_empty())
+        {
+            bail!("macos.notarization.keychain-profile must not be empty");
         }
         Ok(())
     }
@@ -811,6 +864,61 @@ targets = ["x86_64-apple-darwin"]
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.build.pre_built_dir.as_deref(), Some("dist/"));
         assert!(config.build.command.is_none());
+    }
+
+    #[test]
+    fn parse_macos_codesign_and_notarization() {
+        let toml = format!(
+            "{}\n[macos.codesign]\nidentity = \"Developer ID Application: Example Corp (TEAMID)\"\nentitlements = \"entitlements.plist\"\n\n[macos.notarization]\nkeychain-profile = \"release-profile\"\n",
+            minimal_toml()
+        );
+        let config = Config::parse(&toml).unwrap();
+        let codesign = config.macos.codesign.unwrap();
+        assert_eq!(
+            codesign.identity,
+            "Developer ID Application: Example Corp (TEAMID)"
+        );
+        assert_eq!(
+            codesign.entitlements.as_deref(),
+            Some(Path::new("entitlements.plist"))
+        );
+        assert_eq!(
+            config.macos.notarization.unwrap().keychain_profile,
+            "release-profile"
+        );
+    }
+
+    #[test]
+    fn notarization_can_use_pre_signed_artifacts() {
+        let toml = format!(
+            "{}\n[macos.notarization]\nkeychain-profile = \"release-profile\"\n",
+            minimal_toml()
+        );
+        let config = Config::parse(&toml).unwrap();
+        assert!(config.macos.codesign.is_none());
+        assert!(config.macos.notarization.is_some());
+    }
+
+    #[test]
+    fn macos_rejects_empty_credentials() {
+        let codesign_toml = format!("{}\n[macos.codesign]\nidentity = \"  \"\n", minimal_toml());
+        let codesign_err = Config::parse(&codesign_toml).unwrap_err();
+        assert!(
+            codesign_err
+                .to_string()
+                .contains("macos.codesign.identity must not be empty")
+        );
+
+        let notarization_toml = format!(
+            "{}\n[macos.notarization]\nkeychain-profile = \"  \"\n",
+            minimal_toml()
+        );
+        let notarization_err = Config::parse(&notarization_toml).unwrap_err();
+        assert!(
+            notarization_err
+                .to_string()
+                .contains("macos.notarization.keychain-profile must not be empty")
+        );
     }
 
     #[test]

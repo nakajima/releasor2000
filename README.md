@@ -91,6 +91,13 @@ targets = [
     "aarch64-unknown-linux-gnu",
 ]
 
+# [macos.codesign]
+# identity = "Developer ID Application: Example Corp (TEAMID)"
+# entitlements = "entitlements.plist"  # optional
+
+# [macos.notarization]
+# keychain-profile = "releasor2000"
+
 [git]
 # type = "gitea"                  # defaults to "github"
 # base-url = "https://git.example.com"
@@ -149,6 +156,31 @@ When `auto-tag = true`, releasor2000 supports Rust packages and Cargo workspace 
 | `targets` | yes | List of Rust target triples to build for |
 
 *Either `command`+`artifact` or `pre-built-dir` is required.
+
+### macOS code signing and notarization
+
+Both sections are optional and apply only to `apple-darwin` targets. Signing runs after the build and before the release archive is created.
+
+```toml
+[macos.codesign]
+identity = "Developer ID Application: Example Corp (TEAMID)"
+entitlements = "entitlements.plist"  # optional
+
+[macos.notarization]
+keychain-profile = "releasor2000"
+```
+
+Code signing uses `codesign` with the hardened runtime and a secure timestamp, then verifies the signature. The signing identity must be available in the build machine's keychain.
+
+Notarization creates a temporary ZIP, submits it with `xcrun notarytool submit --wait`, and publishes the existing `.tar.gz` only after Apple accepts the submission. Configure the keychain profile once without storing credentials in the config:
+
+```sh
+xcrun notarytool store-credentials releasor2000
+```
+
+The `[macos.notarization]` section can also notarize pre-signed artifacts when `[macos.codesign]` is omitted. Releasor2000 verifies that those artifacts have a valid code signature before submission.
+
+Apple creates an online ticket for standalone binaries, but does not support stapling tickets to them. Gatekeeper retrieves the ticket when the binary is first opened.
 
 ## Channels
 
@@ -234,3 +266,6 @@ macOS targets can cross-compile between x86_64 and aarch64 natively on macOS. Bu
 - **cargo-zigbuild** (optional) — preferred cross-compilation backend
 - **cross** (optional) — fallback cross-compilation backend
 - **nix** (optional) — required only for the nix channel
+- **Xcode command-line tools** (optional) — `codesign` is required for macOS signing; Xcode 13 or later with `notarytool` is required for notarization
+- **Developer ID Application certificate** (optional) — required in the build machine's keychain for distributable macOS signatures
+- **notarytool keychain profile** (optional) — required when `[macos.notarization]` is configured
