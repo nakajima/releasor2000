@@ -236,7 +236,8 @@ impl Macos {
                 "--output-format",
                 "json",
             ],
-        )?;
+        )
+        .map_err(|error| Self::with_notarytool_credentials_help(error, keychain_profile))?;
         let response: serde_json::Value = serde_json::from_str(&output)
             .with_context(|| format!("[notarize] invalid notarytool response: {output}"))?;
         let status = response["status"]
@@ -268,6 +269,26 @@ impl Macos {
             "[notarize] submission {} finished with status {status}:\n{log}",
             id.unwrap_or("<unknown>")
         )
+    }
+
+    fn with_notarytool_credentials_help(
+        error: anyhow::Error,
+        keychain_profile: &str,
+    ) -> anyhow::Error {
+        if !error.chain().any(|cause| {
+            cause
+                .to_string()
+                .contains("No Keychain password item found for profile")
+        }) {
+            return error;
+        }
+
+        let quoted_profile = format!("'{}'", keychain_profile.replace('\'', "'\"'\"'"));
+        error.context(format!(
+            "[notarize] no credentials are stored for keychain profile {keychain_profile:?}\n\
+Create them for the current macOS user:\n  xcrun notarytool store-credentials {quoted_profile}\n\
+Enter your Apple ID, 10-character Team ID, and an app-specific password (not your normal Apple ID password)."
+        ))
     }
 }
 
@@ -1465,6 +1486,11 @@ pub fn release(
     }
 
     println!("Done.");
+    if selected.contains(&"curl") {
+        let install_url = git.release_download_url(&config.project.repo, &version, "install.sh");
+        println!("Install with:");
+        println!("  curl -fsSL {install_url} | sh");
+    }
     Ok(())
 }
 
@@ -2882,6 +2908,24 @@ targets = ["x86_64-apple-darwin"]
     }
 
     // --- macOS signing tests ---
+
+    #[test]
+    fn missing_notarytool_profile_error_includes_setup_instructions() {
+        let error = Macos::with_notarytool_credentials_help(
+            anyhow::anyhow!(
+                "[notarize] xcrun failed: Error: No Keychain password item found for profile"
+            ),
+            "release profile",
+        );
+        let message = error.to_string();
+
+        assert!(
+            message.contains("xcrun notarytool store-credentials 'release profile'"),
+            "got: {message}"
+        );
+        assert!(message.contains("10-character Team ID"), "got: {message}");
+        assert!(message.contains("app-specific password"), "got: {message}");
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

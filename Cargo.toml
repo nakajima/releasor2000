@@ -1,6 +1,6 @@
 [package]
 name = "releasor2000"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 description = "Release your bin everywhere*."
 license = "BSD-3-Clause"
