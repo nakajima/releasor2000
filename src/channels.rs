@@ -52,10 +52,14 @@ impl GitContext {
         self.repo_api_url(repo, &format!("/contents/{path}"))
     }
 
+    fn release_download_base_url(&self, repo: &str, version: &str) -> String {
+        format!("{}/{repo}/releases/download/v{version}", self.web_base_url)
+    }
+
     fn release_download_url(&self, repo: &str, version: &str, asset_name: &str) -> String {
         format!(
-            "{}/{repo}/releases/download/v{version}/{asset_name}",
-            self.web_base_url
+            "{}/{asset_name}",
+            self.release_download_base_url(repo, version)
         )
     }
 
@@ -614,11 +618,26 @@ fn detect_version(config: &Config, version_override: Option<&str>) -> Result<Str
             .split_first()
             .ok_or_else(|| anyhow::anyhow!("empty version-command"))?;
         run_cmd("version", None, bin, args).context("version-command failed")?
+    } else if let Some(version) = read_version_file(Path::new(".version"))? {
+        version
     } else {
         run_cmd("version", None, "git", &["describe", "--tags", "--abbrev=0"])
-            .context("could not detect version from git tags — use --version or set version-command in config")?
+            .context("could not detect version from git tags — use --version, set version-command in config, or add a .version file")?
     };
     Ok(normalize_version(&raw))
+}
+
+fn read_version_file(path: &Path) -> Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("[version] failed to read {}", path.display()))?;
+    let version = raw.trim();
+    if version.is_empty() {
+        bail!("[version] {} is empty", path.display());
+    }
+    Ok(Some(version.to_string()))
 }
 
 fn confirm(prompt: &str) -> Result<bool> {
@@ -1309,20 +1328,20 @@ fn preflight(
 ) -> Result<()> {
     let mut missing = Vec::new();
 
-    let needs_git_api = selected
-        .iter()
-        .any(|ch| matches!(*ch, "git" | "homebrew" | "curl" | "nix"));
+    let needs_git_api = selected.iter().any(|ch| config.uses_git_host(ch));
+    let curl_scp = curl_scp_url(config, selected).is_some();
 
-    if needs_git_api {
-        if std::env::var(&git.token_env).is_err() {
-            missing.push(format!(
-                "{} env var is required for: git, homebrew, curl, nix",
-                git.token_env
-            ));
-        }
-        if !command_exists("curl") {
-            missing.push("curl command is required for: git, homebrew, curl, nix".to_string());
-        }
+    if needs_git_api && std::env::var(&git.token_env).is_err() {
+        missing.push(format!(
+            "{} env var is required for: git, homebrew, curl, nix",
+            git.token_env
+        ));
+    }
+    if (needs_git_api || curl_scp) && !command_exists("curl") {
+        missing.push("curl command is required for: git, homebrew, curl, nix".to_string());
+    }
+    if curl_scp && !command_exists("scp") {
+        missing.push("scp command is required for: curl with dest".to_string());
     }
 
     if selected.contains(&"nix") && !command_exists("nix") {
@@ -1348,7 +1367,7 @@ fn preflight(
 
     let depends_on_git = selected
         .iter()
-        .any(|ch| matches!(*ch, "homebrew" | "curl" | "nix"));
+        .any(|ch| *ch != "git" && config.uses_git_host(ch));
     if depends_on_git && !selected.contains(&"git") {
         missing.push("git channel must be selected when using: homebrew, curl, nix".to_string());
     }
@@ -1418,6 +1437,9 @@ pub fn release(
     if auto_tag_enabled {
         CreatedTag::ensure_available(&version)?;
     }
+    if let Some(url) = curl_scp_url(config, &selected) {
+        ensure_unpublished(url, &version)?;
+    }
 
     println!(
         "Releasing {} v{version} via: {}",
@@ -1466,7 +1488,7 @@ pub fn release(
                 "git" => release_git(config, &git, &version, &archives)?,
                 "homebrew" => release_homebrew(config, &git, &version, &archives)?,
                 "cargo" => release_cargo(config, cargo_package.as_ref())?,
-                "curl" => release_curl(config, &git, &version)?,
+                "curl" => release_curl(config, &git, &version, &archives)?,
                 "nix" => release_nix(config, &git, &version, &archives)?,
                 _ => unreachable!(),
             }
@@ -1487,7 +1509,10 @@ pub fn release(
 
     println!("Done.");
     if selected.contains(&"curl") {
-        let install_url = git.release_download_url(&config.project.repo, &version, "install.sh");
+        let install_url = match curl_scp_url(config, &selected) {
+            Some(url) => format!("{url}/install.sh"),
+            None => git.release_download_url(config.project.repo(), &version, "install.sh"),
+        };
         println!("Install with:");
         println!("  curl -fsSL {install_url} | sh");
     }
@@ -1495,6 +1520,14 @@ pub fn release(
 }
 
 // --- Channel implementations ---
+
+/// The public URL of the scp destination, when curl is selected and uploads with scp.
+fn curl_scp_url<'a>(config: &'a Config, selected: &[&str]) -> Option<&'a str> {
+    if !selected.contains(&"curl") {
+        return None;
+    }
+    config.channels.curl.as_ref()?.scp_url()
+}
 
 fn release_upload_url(
     git: &GitContext,
@@ -1602,9 +1635,9 @@ fn release_git(
     version: &str,
     archives: &[BuiltArchive],
 ) -> Result<()> {
-    let upload_url = create_release(git, &config.project.repo, version)?;
+    let upload_url = create_release(git, config.project.repo(), version)?;
     for archive in archives {
-        delete_existing_asset_if_any(git, &config.project.repo, version, &archive.asset_name)?;
+        delete_existing_asset_if_any(git, config.project.repo(), version, &archive.asset_name)?;
         git_upload_asset(
             git,
             "git",
@@ -1627,7 +1660,7 @@ fn release_homebrew(
     let ch = config.channels.homebrew.as_ref().unwrap();
     let formula_name = ch.formula_name.as_deref().unwrap_or(&config.project.name);
     let binary = config.project.primary_binary();
-    let repo = &config.project.repo;
+    let repo = config.project.repo();
 
     let release_url = git.repo_api_url(repo, &format!("/releases/tags/v{version}"));
     git_api(git, "homebrew", "GET", &release_url, None).with_context(|| {
@@ -1748,15 +1781,37 @@ fn release_cargo(config: &Config, cargo_package: Option<&CargoPackageSelection>)
     Ok(())
 }
 
-fn release_curl(config: &Config, git: &GitContext, version: &str) -> Result<()> {
+fn release_curl(
+    config: &Config,
+    git: &GitContext,
+    version: &str,
+    archives: &[BuiltArchive],
+) -> Result<()> {
+    let ch = config.channels.curl.as_ref().unwrap();
     let binary = config.project.primary_binary();
-    let repo = &config.project.repo;
 
-    let script = generate_install_script(binary, repo, version, &git.web_base_url);
+    let mut hashes = Vec::new();
+    for archive in archives.iter().filter(|archive| archive.binary == binary) {
+        hashes.push((archive.target.as_str(), sha256(&archive.archive_path)?));
+    }
+    if hashes.is_empty() {
+        bail!("[curl] no archives were built for {binary}");
+    }
+
+    let download_base_url = match ch.scp_url() {
+        Some(url) => url.to_string(),
+        None => git.release_download_base_url(config.project.repo(), version),
+    };
+    let script = generate_install_script(binary, version, &download_base_url, &hashes);
 
     let script_path = PathBuf::from("target/release-staging/install.sh");
     std::fs::write(&script_path, &script)?;
 
+    if let Some(dest) = ch.dest.as_deref() {
+        return scp_release(dest, version, archives, &script_path);
+    }
+
+    let repo = config.project.repo();
     // Get the release to find its upload URL
     let url = git.repo_api_url(repo, &format!("/releases/tags/v{version}"));
     let resp = git_api(git, "curl", "GET", &url, None)?;
@@ -1777,15 +1832,94 @@ fn release_curl(config: &Config, git: &GitContext, version: &str) -> Result<()> 
     Ok(())
 }
 
-fn generate_install_script(binary: &str, repo: &str, version: &str, web_base_url: &str) -> String {
+/// Uploads archives, install scripts, then version.json, which marks the release as published.
+fn scp_release(
+    dest: &str,
+    version: &str,
+    archives: &[BuiltArchive],
+    script_path: &Path,
+) -> Result<()> {
+    let staging = script_path.parent().unwrap_or_else(|| Path::new("."));
+    let versioned_script = staging.join(format!("install-{version}.sh"));
+    std::fs::copy(script_path, &versioned_script)?;
+
+    let mut uploads: Vec<&Path> = archives.iter().map(|a| a.archive_path.as_path()).collect();
+    uploads.push(&versioned_script);
+
+    let mut files = serde_json::Map::new();
+    for path in uploads.iter().chain([&script_path]) {
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("{} has no filename", path.display()))?;
+        files.insert(name.to_string_lossy().into_owned(), sha256(path)?.into());
+    }
+    let manifest = serde_json::json!({ "version": version, "files": files });
+    let manifest_path = staging.join("version.json");
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+
+    // Separate scp runs so a failed upload never leaves install.sh or version.json ahead of it.
+    for batch in [uploads, vec![script_path], vec![manifest_path.as_path()]] {
+        let mut args: Vec<String> = batch
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        args.push(dest.to_string());
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_cmd("curl", None, "scp", &args)?;
+    }
+    println!("[curl] Uploaded v{version} to {dest}");
+    Ok(())
+}
+
+fn ensure_unpublished(url: &str, version: &str) -> Result<()> {
+    let manifest_url = format!("{url}/version.json");
+    let output = run_cmd(
+        "curl",
+        None,
+        "curl",
+        &["-sSL", "-w", "%{http_code}", &manifest_url],
+    )?;
+    let published = parse_published_version(&output)
+        .with_context(|| format!("[curl] could not read {manifest_url}"))?;
+    if published.as_deref() == Some(version) {
+        bail!("[curl] v{version} is already published at {manifest_url}");
+    }
+    Ok(())
+}
+
+/// Parses `curl -w "%{http_code}"` output for version.json; a 404 means nothing is published yet.
+fn parse_published_version(output: &str) -> Result<Option<String>> {
+    let (body, status) = output.split_at(output.len().saturating_sub(3));
+    match status {
+        "200" => {
+            let manifest: serde_json::Value = serde_json::from_str(body)?;
+            let version = manifest["version"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing version"))?;
+            Ok(Some(version.to_string()))
+        }
+        "404" => Ok(None),
+        _ => bail!("unexpected HTTP status {status}"),
+    }
+}
+
+fn generate_install_script(
+    binary: &str,
+    version: &str,
+    download_base_url: &str,
+    hashes: &[(&str, String)],
+) -> String {
+    let checksums: String = hashes
+        .iter()
+        .map(|(target, sha)| format!("  {target}) SHA256=\"{sha}\" ;;\n"))
+        .collect();
     format!(
         r#"#!/bin/sh
 set -eu
 
 BINARY="{binary}"
-REPO="{repo}"
 VERSION="{version}"
-RELEASE_BASE_URL="{web_base_url}"
+DOWNLOAD_BASE_URL="{download_base_url}"
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
@@ -1803,13 +1937,28 @@ case "$ARCH" in
 esac
 
 TARGET="${{ARCH_TARGET}}-${{OS_TARGET}}"
-URL="${{RELEASE_BASE_URL}}/${{REPO}}/releases/download/v${{VERSION}}/${{BINARY}}-${{VERSION}}-${{TARGET}}.tar.gz"
+case "$TARGET" in
+{checksums}  *) echo "No $BINARY v$VERSION build for $TARGET" >&2; exit 1 ;;
+esac
+URL="${{DOWNLOAD_BASE_URL}}/${{BINARY}}-${{VERSION}}-${{TARGET}}.tar.gz"
 
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
+ARCHIVE="$TMPDIR/$BINARY.tar.gz"
 
 echo "Downloading $BINARY v$VERSION for $TARGET..."
-curl -fsSL "$URL" | tar xz -C "$TMPDIR"
+curl -fsSL "$URL" -o "$ARCHIVE"
+
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL="$(sha256sum "$ARCHIVE" | cut -d ' ' -f 1)"
+else
+  ACTUAL="$(shasum -a 256 "$ARCHIVE" | cut -d ' ' -f 1)"
+fi
+if [ "$ACTUAL" != "$SHA256" ]; then
+  echo "Checksum mismatch for $URL" >&2
+  exit 1
+fi
+tar xzf "$ARCHIVE" -C "$TMPDIR"
 
 if [ -z "${{INSTALL_DIR:-}}" ]; then
   if [ -t 0 ] && [ -r /dev/tty ]; then
@@ -1904,7 +2053,7 @@ fn release_nix(
 ) -> Result<()> {
     let ch = config.channels.nix.as_ref().unwrap();
     let binary = config.project.primary_binary();
-    let repo = &config.project.repo;
+    let repo = config.project.repo();
     let flake_repo = ch.flake_repo.as_deref().unwrap_or(repo);
 
     // Download release assets from git release and hash them (local archives may differ)
@@ -2218,14 +2367,18 @@ targets = ["x86_64-unknown-linux-gnu"]
         assert_eq!(normalize_version("1.2.3"), "1.2.3");
     }
 
-    fn write_temp_manifest(content: &str) -> PathBuf {
+    fn temp_test_dir(name: &str) -> PathBuf {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("releasor2000-test-{stamp}"));
+        let dir = std::env::temp_dir().join(format!("{name}-{}-{stamp}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("Cargo.toml");
+        dir
+    }
+
+    fn write_temp_manifest(content: &str) -> PathBuf {
+        let path = temp_test_dir("releasor2000-test").join("Cargo.toml");
         std::fs::write(&path, content).unwrap();
         path
     }
@@ -2241,14 +2394,9 @@ targets = ["x86_64-unknown-linux-gnu"]
                 return None;
             }
 
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let root = std::env::temp_dir().join(format!("{name}-{stamp}"));
+            let root = temp_test_dir(name);
             let remote = root.join("origin.git");
             let repo = root.join("repo");
-            std::fs::create_dir_all(&root).unwrap();
 
             Self::run_git(None, &["init", "--bare", remote.to_str().unwrap()]);
             Self::run_git(None, &["init", repo.to_str().unwrap()]);
@@ -2732,24 +2880,44 @@ targets = ["x86_64-apple-darwin"]
 
     // --- generate_install_script tests ---
 
-    #[test]
-    fn generate_install_script_starts_with_shebang() {
-        let script = generate_install_script("tool", "owner/repo", "1.0.0", GITHUB_BASE_URL);
-        assert!(script.starts_with("#!/bin/sh"));
+    const INSTALL_TARGETS: [&str; 4] = [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+    ];
+
+    fn install_script(binary: &str, version: &str) -> String {
+        let hashes = [("x86_64-unknown-linux-gnu", "abc123".to_string())];
+        generate_install_script(binary, version, "https://dl.example.com", &hashes)
     }
 
     #[test]
-    fn generate_install_script_contains_repo_binary_version() {
-        let script = generate_install_script("mytool", "cool/repo", "3.2.1", GITHUB_BASE_URL);
+    fn generate_install_script_starts_with_shebang() {
+        assert!(install_script("tool", "1.0.0").starts_with("#!/bin/sh"));
+    }
+
+    #[test]
+    fn generate_install_script_contains_binary_version_and_url() {
+        let script = install_script("mytool", "3.2.1");
         assert!(script.contains("BINARY=\"mytool\""));
-        assert!(script.contains("REPO=\"cool/repo\""));
         assert!(script.contains("VERSION=\"3.2.1\""));
-        assert!(script.contains("RELEASE_BASE_URL=\"https://github.com\""));
+        assert!(script.contains("DOWNLOAD_BASE_URL=\"https://dl.example.com\""));
+        assert!(
+            script.contains("URL=\"${DOWNLOAD_BASE_URL}/${BINARY}-${VERSION}-${TARGET}.tar.gz\"")
+        );
+    }
+
+    #[test]
+    fn generate_install_script_lists_checksum_per_target() {
+        let script = install_script("tool", "1.0.0");
+        assert!(script.contains("  x86_64-unknown-linux-gnu) SHA256=\"abc123\" ;;\n"));
+        assert!(script.contains("*) echo \"No $BINARY v$VERSION build for $TARGET\""));
     }
 
     #[test]
     fn generate_install_script_handles_all_arch_os_combos() {
-        let script = generate_install_script("tool", "owner/repo", "1.0.0", GITHUB_BASE_URL);
+        let script = install_script("tool", "1.0.0");
         assert!(script.contains("Linux)"));
         assert!(script.contains("Darwin)"));
         assert!(script.contains("x86_64|amd64)"));
@@ -2758,16 +2926,141 @@ targets = ["x86_64-apple-darwin"]
 
     #[test]
     fn generate_install_script_prompts_for_install_dir() {
-        let script = generate_install_script("tool", "owner/repo", "1.0.0", GITHUB_BASE_URL);
+        let script = install_script("tool", "1.0.0");
         assert!(script.contains("printf \"Install directory [/usr/local/bin]: \""));
         assert!(script.contains("read -r INSTALL_DIR < /dev/tty || true"));
     }
 
     #[test]
     fn generate_install_script_defaults_install_dir_when_non_interactive() {
-        let script = generate_install_script("tool", "owner/repo", "1.0.0", GITHUB_BASE_URL);
+        let script = install_script("tool", "1.0.0");
         assert!(script.contains("if [ -t 0 ] && [ -r /dev/tty ]; then"));
         assert!(script.contains("INSTALL_DIR=\"/usr/local/bin\""));
+    }
+
+    #[test]
+    fn install_script_verifies_checksum_before_installing() {
+        if !matches!(std::env::consts::OS, "linux" | "macos")
+            || !matches!(std::env::consts::ARCH, "x86_64" | "aarch64")
+        {
+            return;
+        }
+        let root = temp_test_dir("releasor2000-install-script");
+        std::fs::write(root.join("tool"), "#!/bin/sh\n").unwrap();
+        run_cmd("test", Some(&root), "tar", &["czf", "tool.tar.gz", "tool"]).unwrap();
+        let archive = root.join("tool.tar.gz");
+        for target in INSTALL_TARGETS {
+            std::fs::copy(&archive, root.join(format!("tool-1.0.0-{target}.tar.gz"))).unwrap();
+        }
+        let base_url = format!("file://{}", root.display());
+        let run = |sha: &str| {
+            let hashes: Vec<(&str, String)> = INSTALL_TARGETS
+                .iter()
+                .map(|target| (*target, sha.to_string()))
+                .collect();
+            let script = root.join("install.sh");
+            std::fs::write(
+                &script,
+                generate_install_script("tool", "1.0.0", &base_url, &hashes),
+            )
+            .unwrap();
+            Command::new("sh")
+                .arg(&script)
+                .env("INSTALL_DIR", root.join("bin"))
+                .output()
+                .unwrap()
+        };
+
+        let tampered = run(&"0".repeat(64));
+        assert!(!tampered.status.success());
+        assert!(String::from_utf8_lossy(&tampered.stderr).contains("Checksum mismatch"));
+        assert!(!root.join("bin/tool").exists());
+
+        let installed = run(&sha256(&archive).unwrap());
+        assert!(
+            installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        assert!(root.join("bin/tool").exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- scp curl tests ---
+
+    #[test]
+    fn scp_release_uploads_archives_scripts_and_manifest() {
+        if !command_exists("scp") {
+            return;
+        }
+        let root = temp_test_dir("releasor2000-scp");
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let asset_name = "tool-1.0.0-x86_64-unknown-linux-gnu.tar.gz";
+        let archive_path = root.join(asset_name);
+        std::fs::write(&archive_path, "archive").unwrap();
+        let script_path = root.join("install.sh");
+        std::fs::write(&script_path, "#!/bin/sh\n").unwrap();
+        let archives = [BuiltArchive {
+            binary: "tool".to_string(),
+            target: "x86_64-unknown-linux-gnu".to_string(),
+            asset_name: asset_name.to_string(),
+            archive_path,
+        }];
+
+        scp_release(dest.to_str().unwrap(), "1.0.0", &archives, &script_path).unwrap();
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dest.join("version.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["version"], "1.0.0");
+        for name in [asset_name, "install-1.0.0.sh", "install.sh"] {
+            assert_eq!(
+                manifest["files"][name],
+                sha256(&dest.join(name)).unwrap(),
+                "{name}"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn parse_published_version_reads_manifest_version() {
+        let output = "{\n  \"version\": \"1.2.3\",\n  \"files\": {}\n}200";
+        assert_eq!(
+            parse_published_version(output).unwrap().as_deref(),
+            Some("1.2.3")
+        );
+    }
+
+    #[test]
+    fn parse_published_version_treats_404_as_unpublished() {
+        assert_eq!(
+            parse_published_version("<h1>Not Found</h1>404").unwrap(),
+            None
+        );
+        assert_eq!(parse_published_version("404").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_published_version_rejects_errors_and_bad_manifests() {
+        assert!(parse_published_version("forbidden403").is_err());
+        assert!(parse_published_version("{}200").is_err());
+        assert!(parse_published_version("").is_err());
+    }
+
+    #[test]
+    fn read_version_file_reads_trimmed_version() {
+        let path = temp_test_dir("releasor2000-version").join(".version");
+        assert_eq!(read_version_file(&path).unwrap(), None);
+
+        std::fs::write(&path, "v1.2.3\n").unwrap();
+        assert_eq!(read_version_file(&path).unwrap().as_deref(), Some("v1.2.3"));
+
+        std::fs::write(&path, "\n").unwrap();
+        let err = read_version_file(&path).unwrap_err();
+        assert!(err.to_string().contains("is empty"), "got: {err}");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     // --- nix_system tests ---
@@ -2930,17 +3223,7 @@ targets = ["x86_64-apple-darwin"]
     #[cfg(target_os = "macos")]
     #[test]
     fn codesign_process_survives_release_archive() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let temp_dir = std::env::temp_dir().join(format!(
-            "releasor2000-codesign-{}-{unique}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&temp_dir).unwrap();
+        let temp_dir = temp_test_dir("releasor2000-codesign");
         let artifact = temp_dir.join("tool");
         std::fs::copy("/usr/bin/true", &artifact).unwrap();
 
@@ -3070,6 +3353,39 @@ targets = ["x86_64-apple-darwin"]
             Some(val) => unsafe { std::env::set_var("GITHUB_TOKEN", val) },
             None => unsafe { std::env::remove_var("GITHUB_TOKEN") },
         }
+    }
+
+    #[test]
+    fn preflight_allows_scp_curl_without_git_host() {
+        if !command_exists("scp") || !command_exists("curl") {
+            return;
+        }
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("GITHUB_TOKEN").ok();
+        unsafe { std::env::remove_var("GITHUB_TOKEN") };
+
+        let config = Config::parse(
+            r#"
+[project]
+name = "tool"
+
+[build]
+command = "cargo build"
+artifact = "target/{target}/release/{binary}"
+targets = ["x86_64-unknown-linux-gnu"]
+
+[channels.curl]
+dest = "host:/srv/dl"
+url = "https://example.com/dl"
+"#,
+        )
+        .unwrap();
+        let result = preflight(&config, &github_git(), &["curl"], false);
+
+        if let Some(val) = saved {
+            unsafe { std::env::set_var("GITHUB_TOKEN", val) };
+        }
+        result.unwrap();
     }
 
     #[test]

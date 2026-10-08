@@ -26,7 +26,7 @@ pub struct Project {
     pub binary: Option<String>,
     pub package: Option<String>,
     pub binaries: Option<Vec<String>>,
-    pub repo: String,
+    pub repo: Option<String>,
     #[serde(alias = "version_command")]
     pub version_command: Option<String>,
     #[serde(default, alias = "auto_tag")]
@@ -260,6 +260,15 @@ pub struct CargoChannel {
 pub struct CurlChannel {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    pub dest: Option<String>,
+    pub url: Option<String>,
+}
+
+impl CurlChannel {
+    /// The public URL serving `dest`, when releases are uploaded with scp.
+    pub fn scp_url(&self) -> Option<&str> {
+        self.url.as_deref().map(|url| url.trim_end_matches('/'))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,6 +293,12 @@ impl Project {
         } else {
             &self.name
         }
+    }
+
+    pub fn repo(&self) -> &str {
+        self.repo
+            .as_deref()
+            .expect("project.repo is validated for git host channels")
     }
 
     pub fn release_binaries(&self) -> Vec<&str> {
@@ -391,6 +406,8 @@ enabled = true
 # crate-name = "{project_name}"
 
 # [channels.curl]
+# dest = "deploy@example.com:/var/www/dl/{project_name}"  # optional: scp here instead of the git host
+# url = "https://example.com/dl/{project_name}"           # required with dest: where dest is served
 
 # [channels.nix]
 # flake-repo = "owner/nix-repo"  # defaults to project repo
@@ -568,6 +585,27 @@ impl Config {
         if self.build.targets.is_empty() {
             bail!("build.targets must not be empty");
         }
+        if let Some(curl) = &self.channels.curl {
+            match (&curl.dest, &curl.url) {
+                (Some(dest), Some(url)) if dest.trim().is_empty() || url.trim().is_empty() => {
+                    bail!("channels.curl.dest and channels.curl.url must not be empty")
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    bail!("channels.curl.dest and channels.curl.url must be set together")
+                }
+                _ => {}
+            }
+        }
+        if self.project.repo.is_none() {
+            let needs_repo: Vec<&str> = self
+                .enabled_channels()
+                .into_iter()
+                .filter(|channel| self.uses_git_host(channel))
+                .collect();
+            if !needs_repo.is_empty() {
+                bail!("project.repo is required for: {}", needs_repo.join(", "));
+            }
+        }
         if let Some(codesign) = &self.macos.codesign {
             if codesign.identity.trim().is_empty() {
                 bail!("macos.codesign.identity must not be empty");
@@ -589,6 +627,19 @@ impl Config {
             bail!("macos.notarization.keychain-profile must not be empty");
         }
         Ok(())
+    }
+
+    /// Whether `channel` publishes through the git host instead of scp or crates.io.
+    pub fn uses_git_host(&self, channel: &str) -> bool {
+        match channel {
+            "git" | "homebrew" | "nix" => true,
+            "curl" => !self
+                .channels
+                .curl
+                .as_ref()
+                .is_some_and(|curl| curl.scp_url().is_some()),
+            _ => false,
+        }
     }
 
     pub fn enabled_channels(&self) -> Vec<&str> {
@@ -644,7 +695,7 @@ targets = ["x86_64-apple-darwin"]
     fn parse_minimal_config() {
         let config = Config::parse(&minimal_toml()).unwrap();
         assert_eq!(config.project.name, "myapp");
-        assert_eq!(config.project.repo, "owner/repo");
+        assert_eq!(config.project.repo(), "owner/repo");
         assert_eq!(config.project.primary_binary(), "myapp");
         assert!(config.project.binary.is_none());
         assert!(config.project.package.is_none());
@@ -1136,6 +1187,58 @@ crate-name = "myapp"
         assert!(GitInfo::from_remote_url("../releasor2000.git").is_none());
     }
 
+    fn no_repo_toml(channels: &str) -> String {
+        format!(
+            r#"
+[project]
+name = "myapp"
+
+[build]
+command = "make"
+artifact = "out/bin"
+targets = ["x86_64-apple-darwin"]
+
+{channels}
+"#
+        )
+    }
+
+    #[test]
+    fn curl_scp_does_not_need_repo() {
+        let config = Config::parse(&no_repo_toml(
+            "[channels.curl]\ndest = \"host:/srv/dl\"\nurl = \"https://example.com/dl/\"",
+        ))
+        .unwrap();
+        let curl = config.channels.curl.as_ref().unwrap();
+        assert_eq!(curl.scp_url(), Some("https://example.com/dl"));
+        assert!(!config.uses_git_host("curl"));
+        assert_eq!(config.enabled_channels(), vec!["curl"]);
+    }
+
+    #[test]
+    fn curl_dest_and_url_must_be_set_together() {
+        for channel in [
+            "[channels.curl]\ndest = \"host:/srv/dl\"",
+            "[channels.curl]\nurl = \"https://example.com/dl\"",
+        ] {
+            let err = Config::parse(&no_repo_toml(channel)).unwrap_err();
+            assert!(
+                err.to_string().contains("must be set together"),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_required_for_git_host_channels() {
+        let err = Config::parse(&no_repo_toml("[channels.git]\n[channels.curl]")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("project.repo is required for: git, curl"),
+            "got: {err}"
+        );
+    }
+
     #[test]
     fn generate_template_parses_successfully() {
         let template = generate_template("myapp", None);
@@ -1147,7 +1250,7 @@ crate-name = "myapp"
         let template = generate_template("cool-tool", None);
         let config = Config::parse(&template).unwrap();
         assert_eq!(config.project.name, "cool-tool");
-        assert_eq!(config.project.repo, "owner/cool-tool");
+        assert_eq!(config.project.repo(), "owner/cool-tool");
     }
 
     #[test]
@@ -1156,7 +1259,7 @@ crate-name = "myapp"
             GitInfo::from_remote_url("ssh://git@git.example.com/team/cool-tool.git").unwrap();
         let template = generate_template("cool-tool", Some(&info));
         let config = Config::parse(&template).unwrap();
-        assert_eq!(config.project.repo, "team/cool-tool");
+        assert_eq!(config.project.repo(), "team/cool-tool");
         assert_eq!(config.git.r#type, GitType::Gitea);
         assert_eq!(config.git.web_base_url(), "https://git.example.com");
     }
@@ -1192,7 +1295,8 @@ enabled = false
 crate-name = "myapp"
 
 [channels.curl]
-url = "https://myapp.dev/install.sh"
+dest = "deploy@myapp.dev:/var/www/dl"
+url = "https://myapp.dev/dl"
 
 [channels.nix]
 flake-repo = "owner/nix-repo"

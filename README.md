@@ -53,6 +53,8 @@ releasor2000 release
 releasor2000 upgrade
 ```
 
+Without `auto-tag`, the version comes from `--version`, then `version-command`, then a `.version` file in the project root (plain text, e.g. `1.2.3`), then `git describe --tags --abbrev=0`.
+
 You can also pass `--version` directly:
 
 ```sh
@@ -130,9 +132,9 @@ Underscore config keys are still accepted for compatibility, but they are deprec
 | `binary` | no | Primary binary for single-binary channels (defaults to `name`) |
 | `package` | no | Cargo workspace package override (auto-detected from `binary` when unique) |
 | `binaries` | no | Additional binaries to package/upload as release assets |
-| `repo` | yes | Repository path (`owner/repo`) |
+| `repo` | yes* | Repository path (`owner/repo`); required for `git`, `homebrew`, `nix`, and `curl` without `dest` |
 | `auto-tag` | no | If true, use `Cargo.toml` package version and create/push annotated git tag `v<version>` when releasing to `git`; try to remove it if the release fails |
-| `version-command` | no | Shell command to detect version (defaults to `git describe --tags --abbrev=0`) |
+| `version-command` | no | Shell command to detect version (defaults to the `.version` file, then `git describe --tags --abbrev=0`) |
 
 If `binaries` is set, releasor2000 builds/packages each `{binary}` per target and uploads each archive as its own release asset. If both `binary` and `binaries` are set, `binary` must be included in `binaries`.
 When `auto-tag = true`, releasor2000 supports Rust packages and Cargo workspace roots. In workspaces, it uses the same binary-to-package detection as release builds, or `[project].package` if set. It fails if tag `v<version>` already exists locally or on `origin`. The tag is created only after artifacts build successfully; if a later release step fails, releasor2000 tries to remove the tag locally and from `origin`.
@@ -184,7 +186,7 @@ Apple creates an online ticket for standalone binaries, but does not support sta
 
 ## Channels
 
-The `git` channel always runs first — it creates the release on your git host and uploads the build artifacts that the other channels (homebrew, curl, nix) depend on.
+The `git` channel always runs first — it creates the release on your git host and uploads the build artifacts that the other channels (homebrew, nix, and curl without `dest`) depend on.
 
 ### Release (`git` channel)
 
@@ -226,14 +228,30 @@ In Cargo workspaces, releasor2000 auto-detects the package when exactly one work
 
 ### Curl
 
-Generates an `install.sh` script that detects OS/arch and downloads the right binary from your configured git host, then uploads it to the release.
+Generates an `install.sh` script that detects OS/arch, downloads the right archive, and verifies its SHA-256 checksum before installing.
 Uses the primary binary (`project.binary`, or the first item in `project.binaries`).
 
 ```toml
 [channels.curl]
 ```
 
-The generated script has the version baked in and is uploaded to the release as `install.sh`.
+By default the script downloads from your configured git host and is uploaded to the release as `install.sh`, with the version baked in.
+
+To release without a git host, set `dest` and `url`:
+
+```toml
+[channels.curl]
+dest = "deploy@example.com:/var/www/dl/myapp"  # scp destination; the directory must exist
+url = "https://example.com/dl/myapp"           # where dest is served
+```
+
+This uploads, in order, every archive plus `install-<version>.sh`, then `install.sh`, then `version.json`, which lists the version and the SHA-256 of each uploaded file. `install.sh` always installs the latest release; `install-<version>.sh` installs that version:
+
+```sh
+curl -fsSL https://example.com/dl/myapp/install.sh | sh
+```
+
+Before building, releasor2000 fetches `<url>/version.json` and stops if that version is already published. Because `version.json` is uploaded last, a failed upload can simply be rerun. `project.repo`, a git token, and the `git` channel are not needed in this mode.
 
 ### Nix
 
@@ -261,11 +279,12 @@ macOS targets can cross-compile between x86_64 and aarch64 natively on macOS. Bu
 
 ## Requirements
 
-- **Git token env var** — required for channels that interact with git APIs (`git`, `homebrew`, `curl`, `nix`); defaults are `GITHUB_TOKEN` (GitHub) and `GITEA_TOKEN` (Gitea), and you can override with `[git].token-env`
+- **Git token env var** — required for channels that interact with git APIs (`git`, `homebrew`, `nix`, and `curl` without `dest`); defaults are `GITHUB_TOKEN` (GitHub) and `GITEA_TOKEN` (Gitea), and you can override with `[git].token-env`
 - **rustup targets** — install targets with `rustup target add <target>`
 - **cargo-zigbuild** (optional) — preferred cross-compilation backend
 - **cross** (optional) — fallback cross-compilation backend
 - **nix** (optional) — required only for the nix channel
+- **scp** (optional) — required only for the curl channel with `dest`
 - **Xcode command-line tools** (optional) — `codesign` is required for macOS signing; Xcode 13 or later with `notarytool` is required for notarization
 - **Developer ID Application certificate** (optional) — required in the build machine's keychain for distributable macOS signatures
 - **notarytool keychain profile** (optional) — required when `[macos.notarization]` is configured
