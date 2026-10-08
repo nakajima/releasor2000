@@ -229,6 +229,7 @@ In Cargo workspaces, releasor2000 auto-detects the package when exactly one work
 ### Curl
 
 Generates an `install.sh` script that detects OS/arch, downloads the right archive, and verifies its SHA-256 checksum before installing.
+It installs to `$INSTALL_DIR` if set; otherwise it asks on the terminal (also under `curl | sh`), defaulting to `~/.local/bin`, and says so if that directory is not on `PATH`.
 Uses the primary binary (`project.binary`, or the first item in `project.binaries`).
 
 ```toml
@@ -241,17 +242,29 @@ To release without a git host, set `dest` and `url`:
 
 ```toml
 [channels.curl]
-dest = "deploy@example.com:/var/www/dl/myapp"  # scp destination; the directory must exist
+dest = "deploy@example.com:/var/www/dl/myapp"  # sftp destination; the directory must exist
 url = "https://example.com/dl/myapp"           # where dest is served
 ```
 
-This uploads, in order, every archive plus `install-<version>.sh`, then `install.sh`, then `version.json`, which lists the version and the SHA-256 of each uploaded file. `install.sh` always installs the latest release; `install-<version>.sh` installs that version:
+Each release goes into its own directory, and `latest` links to the newest:
 
-```sh
-curl -fsSL https://example.com/dl/myapp/install.sh | sh
+```
+myapp/
+  1.2.3/
+    myapp-1.2.3-aarch64-apple-darwin.tar.gz
+    install.sh
+    version.json
+  latest -> 1.2.3
 ```
 
-Before building, releasor2000 fetches `<url>/version.json` and stops if that version is already published. Because `version.json` is uploaded last, a failed upload can simply be rerun. `project.repo`, a git token, and the `git` channel are not needed in this mode.
+One `sftp` session creates `<version>/`, uploads the archives, `install.sh`, and finally `version.json` (the version and the SHA-256 of each file), then swaps `latest` to the new directory with a rename. If any upload fails, `latest` is left alone. Install the latest release, or a specific one:
+
+```sh
+curl -fsSL https://example.com/dl/myapp/latest/install.sh | sh
+curl -fsSL https://example.com/dl/myapp/1.2.3/install.sh | sh
+```
+
+Before building, releasor2000 checks `<url>/<version>/version.json` and stops if it exists. Because `version.json` is uploaded last, a failed upload can simply be rerun. `project.repo`, a git token, and the `git` channel are not needed in this mode. `sftp` runs in batch mode, so `dest` needs key-based SSH authentication, and the web server must follow symlinks (nginx and Caddy do by default).
 
 ### Nix
 
@@ -284,7 +297,7 @@ macOS targets can cross-compile between x86_64 and aarch64 natively on macOS. Bu
 - **cargo-zigbuild** (optional) — preferred cross-compilation backend
 - **cross** (optional) — fallback cross-compilation backend
 - **nix** (optional) — required only for the nix channel
-- **scp** (optional) — required only for the curl channel with `dest`
+- **sftp** (optional) — required only for the curl channel with `dest`
 - **Xcode command-line tools** (optional) — `codesign` is required for macOS signing; Xcode 13 or later with `notarytool` is required for notarization
 - **Developer ID Application certificate** (optional) — required in the build machine's keychain for distributable macOS signatures
 - **notarytool keychain profile** (optional) — required when `[macos.notarization]` is configured

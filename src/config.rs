@@ -265,8 +265,8 @@ pub struct CurlChannel {
 }
 
 impl CurlChannel {
-    /// The public URL serving `dest`, when releases are uploaded with scp.
-    pub fn scp_url(&self) -> Option<&str> {
+    /// The public URL serving `dest`, when releases are uploaded with sftp.
+    pub fn sftp_url(&self) -> Option<&str> {
         self.url.as_deref().map(|url| url.trim_end_matches('/'))
     }
 }
@@ -406,7 +406,7 @@ enabled = true
 # crate-name = "{project_name}"
 
 # [channels.curl]
-# dest = "deploy@example.com:/var/www/dl/{project_name}"  # optional: scp here instead of the git host
+# dest = "deploy@example.com:/var/www/dl/{project_name}"  # optional: sftp here instead of the git host
 # url = "https://example.com/dl/{project_name}"           # required with dest: where dest is served
 
 # [channels.nix]
@@ -629,7 +629,7 @@ impl Config {
         Ok(())
     }
 
-    /// Whether `channel` publishes through the git host instead of scp or crates.io.
+    /// Whether `channel` publishes through the git host instead of sftp or crates.io.
     pub fn uses_git_host(&self, channel: &str) -> bool {
         match channel {
             "git" | "homebrew" | "nix" => true,
@@ -637,7 +637,7 @@ impl Config {
                 .channels
                 .curl
                 .as_ref()
-                .is_some_and(|curl| curl.scp_url().is_some()),
+                .is_some_and(|curl| curl.sftp_url().is_some()),
             _ => false,
         }
     }
@@ -1204,13 +1204,13 @@ targets = ["x86_64-apple-darwin"]
     }
 
     #[test]
-    fn curl_scp_does_not_need_repo() {
+    fn curl_sftp_does_not_need_repo() {
         let config = Config::parse(&no_repo_toml(
             "[channels.curl]\ndest = \"host:/srv/dl\"\nurl = \"https://example.com/dl/\"",
         ))
         .unwrap();
         let curl = config.channels.curl.as_ref().unwrap();
-        assert_eq!(curl.scp_url(), Some("https://example.com/dl"));
+        assert_eq!(curl.sftp_url(), Some("https://example.com/dl"));
         assert!(!config.uses_git_host("curl"));
         assert_eq!(config.enabled_channels(), vec!["curl"]);
     }
