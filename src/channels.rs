@@ -978,20 +978,21 @@ fn plan_cargo_build(
         return CargoBuildPlan::RunAsIs;
     }
 
-    if !host.contains("darwin") && target.contains("apple-darwin") {
-        return CargoBuildPlan::Skip(
-            "macOS targets require Apple SDK/toolchains; build these on a macOS runner",
-        );
-    }
-
-    if zigbuild_available && !target.contains("apple-darwin") {
+    if zigbuild_available {
         return CargoBuildPlan::ReplaceCommand {
             replacement: "cargo zigbuild",
             tool_name: "cargo-zigbuild",
         };
     }
 
-    if cross_available && !target.contains("apple-darwin") {
+    // cross has no macOS images, and needs_cross_linker already let macOS hosts through.
+    if target.contains("apple-darwin") {
+        return CargoBuildPlan::Skip(
+            "macOS targets require cargo-zigbuild on non-macOS hosts; install it or build on a macOS runner",
+        );
+    }
+
+    if cross_available {
         return CargoBuildPlan::ReplaceCommand {
             replacement: "cross build",
             tool_name: "cross",
@@ -2589,11 +2590,28 @@ members = ["app"]
     }
 
     #[test]
-    fn plan_cargo_build_skips_darwin_on_non_darwin_hosts() {
+    fn plan_cargo_build_uses_zigbuild_for_darwin_on_non_darwin_hosts() {
         let plan = plan_cargo_build(
             "x86_64-unknown-linux-gnu",
             "aarch64-apple-darwin",
             true,
+            true,
+        );
+        assert!(matches!(
+            plan,
+            CargoBuildPlan::ReplaceCommand {
+                replacement: "cargo zigbuild",
+                tool_name: "cargo-zigbuild"
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_cargo_build_skips_darwin_on_non_darwin_hosts_without_zigbuild() {
+        let plan = plan_cargo_build(
+            "x86_64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            false,
             true,
         );
         assert!(matches!(plan, CargoBuildPlan::Skip(_)));

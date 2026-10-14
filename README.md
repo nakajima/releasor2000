@@ -308,7 +308,7 @@ When building for a target that differs from the host, releasor2000 prefers:
 
 If neither is installed, it falls back to plain `cargo build` (which may still work if you configured `CARGO_TARGET_<TRIPLE>_LINKER`).
 
-macOS targets can cross-compile between x86_64 and aarch64 natively on macOS. Building macOS targets from non-macOS hosts usually requires Apple SDK tooling, so use a macOS builder for those targets.
+macOS targets can cross-compile between x86_64 and aarch64 natively on macOS. On other hosts, macOS targets are built with `cargo-zigbuild` and skipped when it isn't installed (`cross` has no macOS images). Crates that link Apple frameworks also need a macOS SDK, set through `SDKROOT`.
 
 ## Requirements
 
