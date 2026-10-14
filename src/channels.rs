@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use toml::Value as TomlValue;
 
-use crate::config::{Config, GitType, Macos};
+use crate::config::{Config, GitType, Macos, Secret};
 
 // --- Shared infrastructure ---
 
@@ -93,15 +93,11 @@ fn run_cmd(label: &str, dir: Option<&Path>, cmd: &str, args: &[&str]) -> Result<
 impl Macos {
     fn preflight_errors(&self) -> Vec<String> {
         let mut missing = Vec::new();
-        let needs_codesign = self.codesign.is_some() || self.notarization.is_some();
-
-        if needs_codesign && !command_exists("codesign") {
-            missing.push(
-                "codesign command is required for macOS signing and notarization".to_string(),
-            );
-        }
+        let mut secrets = Vec::new();
 
         if let Some(codesign) = &self.codesign {
+            secrets.push(codesign.p12());
+            secrets.push(codesign.p12_password());
             if let Some(entitlements) = &codesign.entitlements {
                 if !entitlements.is_file() {
                     missing.push(format!(
@@ -111,25 +107,32 @@ impl Macos {
                 }
             }
         }
-
-        if self.notarization.is_some() {
-            if !command_exists("ditto") {
-                missing.push("ditto command is required for macOS notarization".to_string());
-            }
-            if !command_exists("xcrun") {
-                missing.push("xcrun command is required for macOS notarization".to_string());
-            } else if !Command::new("xcrun")
-                .args(["--find", "notarytool"])
-                .output()
-                .is_ok_and(|output| output.status.success())
-            {
-                missing.push(
-                    "notarytool is required for macOS notarization; install Xcode 13 or later"
-                        .to_string(),
-                );
+        if let Some(notarization) = &self.notarization {
+            secrets.push(notarization.api_key());
+            if !command_exists("zip") {
+                missing.push("zip command is required for macOS notarization".to_string());
             }
         }
 
+        if (self.codesign.is_some() || self.notarization.is_some()) && !command_exists("rcodesign")
+        {
+            missing.push(
+                "rcodesign command is required for macOS signing and notarization".to_string(),
+            );
+        }
+
+        for secret in secrets {
+            match secret {
+                Ok(Secret::File { key, path }) if !path.is_file() => {
+                    missing.push(format!("{key}-file not found: {}", path.display()));
+                }
+                Ok(Secret::Env { key, var }) if std::env::var_os(var).is_none() => {
+                    missing.push(format!("{var} env var is required for {key}-env"));
+                }
+                Ok(_) => {}
+                Err(error) => missing.push(error.to_string()),
+            }
+        }
         missing
     }
 
@@ -139,51 +142,63 @@ impl Macos {
         staging: &Path,
         archive_stem: &str,
     ) -> Result<()> {
+        if self.codesign.is_none() && self.notarization.is_none() {
+            return Ok(());
+        }
+        let secrets = SecretDir::create()?;
+
         if let Some(codesign) = &self.codesign {
-            let mut args = vec![
-                "--force".to_string(),
-                "--sign".to_string(),
-                codesign.identity.clone(),
-                "--options".to_string(),
-                "runtime".to_string(),
-                "--timestamp".to_string(),
-            ];
-            if let Some(entitlements) = &codesign.entitlements {
-                args.push("--entitlements".to_string());
-                args.push(entitlements.to_string_lossy().into_owned());
-            }
-            args.push(artifact_path.to_string_lossy().into_owned());
+            let p12 = secrets.path(codesign.p12()?, "developer-id.p12", true)?;
+            let p12_password =
+                secrets.path(codesign.p12_password()?, "developer-id.p12.password", false)?;
+            let args = Self::sign_args(
+                &p12,
+                &p12_password,
+                codesign.entitlements.as_deref(),
+                artifact_path,
+            );
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            run_cmd("codesign", None, "codesign", &args)?;
+            run_cmd("codesign", None, "rcodesign", &args)?;
         }
 
-        if self.codesign.is_some() || self.notarization.is_some() {
-            self.verify_signature(artifact_path)?;
-        }
-
-        if self.notarization.is_some() {
-            self.notarize(artifact_path, staging, archive_stem)?;
+        if let Some(notarization) = &self.notarization {
+            let api_key =
+                secrets.path(notarization.api_key()?, "app-store-connect-key.json", false)?;
+            Self::notarize(&api_key, artifact_path, staging, archive_stem)?;
         }
 
         Ok(())
     }
 
-    fn verify_signature(&self, artifact_path: &Path) -> Result<()> {
-        let artifact_path = artifact_path.to_string_lossy();
-        run_cmd(
-            "codesign",
-            None,
-            "codesign",
-            &["--verify", "--strict", "--verbose=2", &artifact_path],
-        )?;
-        Ok(())
+    fn sign_args(
+        p12: &Path,
+        p12_password: &Path,
+        entitlements: Option<&Path>,
+        artifact_path: &Path,
+    ) -> Vec<String> {
+        let mut args = vec![
+            "sign".to_string(),
+            "--p12-file".to_string(),
+            p12.to_string_lossy().into_owned(),
+            "--p12-password-file".to_string(),
+            p12_password.to_string_lossy().into_owned(),
+            "--code-signature-flags".to_string(),
+            "runtime".to_string(),
+        ];
+        if let Some(entitlements) = entitlements {
+            args.push("--entitlements-xml-file".to_string());
+            args.push(entitlements.to_string_lossy().into_owned());
+        }
+        args.push(artifact_path.to_string_lossy().into_owned());
+        args
     }
 
-    fn notarize(&self, artifact_path: &Path, staging: &Path, archive_stem: &str) -> Result<()> {
-        let notarization = self
-            .notarization
-            .as_ref()
-            .expect("notarization configuration required");
+    fn notarize(
+        api_key: &Path,
+        artifact_path: &Path,
+        staging: &Path,
+        archive_stem: &str,
+    ) -> Result<()> {
         let zip_path = staging.join(format!("{archive_stem}.notarization.zip"));
         if zip_path.exists() {
             std::fs::remove_file(&zip_path).with_context(|| {
@@ -193,106 +208,94 @@ impl Macos {
 
         let artifact_path_arg = artifact_path.to_string_lossy();
         let zip_path_arg = zip_path.to_string_lossy();
+        let api_key = api_key.to_string_lossy();
         run_cmd(
             "notarize",
             None,
-            "ditto",
-            &[
-                "-c",
-                "-k",
-                "--keepParent",
-                &artifact_path_arg,
-                &zip_path_arg,
-            ],
+            "zip",
+            &["-j", &zip_path_arg, &artifact_path_arg],
         )?;
-
-        let result = self.submit_notarization(&zip_path, &notarization.keychain_profile);
-        match result {
-            Ok(()) => {
-                std::fs::remove_file(&zip_path).with_context(|| {
-                    format!(
-                        "[notarize] removing temporary archive {}",
-                        zip_path.display()
-                    )
-                })?;
-                Ok(())
-            }
-            Err(error) => Err(error.context(format!(
-                "[notarize] submission archive kept at {}",
-                zip_path.display()
-            ))),
-        }
-    }
-
-    fn submit_notarization(&self, zip_path: &Path, keychain_profile: &str) -> Result<()> {
-        let zip_path = zip_path.to_string_lossy();
-        let output = run_cmd(
+        // rcodesign exits non-zero and prints Apple's log when a submission is not accepted.
+        run_cmd(
             "notarize",
             None,
-            "xcrun",
+            "rcodesign",
             &[
-                "notarytool",
-                "submit",
-                &zip_path,
-                "--keychain-profile",
-                keychain_profile,
+                "notary-submit",
+                "--api-key-file",
+                &api_key,
                 "--wait",
-                "--output-format",
-                "json",
+                "--max-wait-seconds",
+                "3600",
+                &zip_path_arg,
             ],
         )
-        .map_err(|error| Self::with_notarytool_credentials_help(error, keychain_profile))?;
-        let response: serde_json::Value = serde_json::from_str(&output)
-            .with_context(|| format!("[notarize] invalid notarytool response: {output}"))?;
-        let status = response["status"]
-            .as_str()
-            .context("[notarize] notarytool response did not include a status")?;
-        if status.eq_ignore_ascii_case("accepted") {
-            return Ok(());
-        }
+        .with_context(|| {
+            format!(
+                "[notarize] submission archive kept at {}",
+                zip_path.display()
+            )
+        })?;
+        std::fs::remove_file(&zip_path).with_context(|| {
+            format!(
+                "[notarize] removing temporary archive {}",
+                zip_path.display()
+            )
+        })
+    }
+}
 
-        let id = response["id"].as_str();
-        let log = id
-            .map(|id| {
-                run_cmd(
-                    "notarize",
-                    None,
-                    "xcrun",
-                    &[
-                        "notarytool",
-                        "log",
-                        id,
-                        "--keychain-profile",
-                        keychain_profile,
-                    ],
-                )
-                .unwrap_or_else(|error| format!("could not retrieve notarization log: {error}"))
-            })
-            .unwrap_or_else(|| "notarytool response did not include a submission ID".to_string());
-        bail!(
-            "[notarize] submission {} finished with status {status}:\n{log}",
-            id.unwrap_or("<unknown>")
-        )
+/// Private temp dir holding env var secrets as files for rcodesign; removed on drop.
+struct SecretDir(PathBuf);
+
+impl SecretDir {
+    fn create() -> Result<Self> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "releasor2000-secrets-{}-{stamp}",
+            std::process::id()
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(&dir)
+            .with_context(|| format!("creating secrets dir {}", dir.display()))?;
+        Ok(Self(dir))
     }
 
-    fn with_notarytool_credentials_help(
-        error: anyhow::Error,
-        keychain_profile: &str,
-    ) -> anyhow::Error {
-        if !error.chain().any(|cause| {
-            cause
-                .to_string()
-                .contains("No Keychain password item found for profile")
-        }) {
-            return error;
-        }
+    /// Path rcodesign should read `secret` from, writing env var contents to `name` in this dir.
+    fn path(&self, secret: Secret<'_>, name: &str, base64: bool) -> Result<PathBuf> {
+        let (key, var) = match secret {
+            Secret::File { path, .. } => return Ok(path.to_path_buf()),
+            Secret::Env { key, var } => (key, var),
+        };
+        let value = std::env::var(var)
+            .with_context(|| format!("{var} env var is required for {key}-env"))?;
+        let contents = if base64 {
+            // Tolerate the line wrapping that GNU base64 adds.
+            let encoded: String = value.split_whitespace().collect();
+            BASE64
+                .decode(encoded)
+                .with_context(|| format!("{var} must be base64 for {key}-env"))?
+        } else {
+            value.into_bytes()
+        };
+        let path = self.0.join(name);
+        std::fs::write(&path, contents)
+            .with_context(|| format!("writing {key}-env secret to {}", path.display()))?;
+        Ok(path)
+    }
+}
 
-        let quoted_profile = format!("'{}'", keychain_profile.replace('\'', "'\"'\"'"));
-        error.context(format!(
-            "[notarize] no credentials are stored for keychain profile {keychain_profile:?}\n\
-Create them for the current macOS user:\n  xcrun notarytool store-credentials {quoted_profile}\n\
-Enter your Apple ID, 10-character Team ID, and an app-specific password (not your normal Apple ID password)."
-        ))
+impl Drop for SecretDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -3281,61 +3284,183 @@ targets = ["x86_64-apple-darwin"]
     // --- macOS signing tests ---
 
     #[test]
-    fn missing_notarytool_profile_error_includes_setup_instructions() {
-        let error = Macos::with_notarytool_credentials_help(
-            anyhow::anyhow!(
-                "[notarize] xcrun failed: Error: No Keychain password item found for profile"
+    fn sign_args_enable_hardened_runtime_with_p12_credentials() {
+        assert_eq!(
+            Macos::sign_args(
+                Path::new("developer-id.p12"),
+                Path::new("developer-id.p12.password"),
+                Some(Path::new("entitlements.plist")),
+                Path::new("target/tool"),
             ),
-            "release profile",
+            [
+                "sign",
+                "--p12-file",
+                "developer-id.p12",
+                "--p12-password-file",
+                "developer-id.p12.password",
+                "--code-signature-flags",
+                "runtime",
+                "--entitlements-xml-file",
+                "entitlements.plist",
+                "target/tool",
+            ]
         );
-        let message = error.to_string();
-
-        assert!(
-            message.contains("xcrun notarytool store-credentials 'release profile'"),
-            "got: {message}"
-        );
-        assert!(message.contains("10-character Team ID"), "got: {message}");
-        assert!(message.contains("app-specific password"), "got: {message}");
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn codesign_process_survives_release_archive() {
-        let temp_dir = temp_test_dir("releasor2000-codesign");
-        let artifact = temp_dir.join("tool");
-        std::fs::copy("/usr/bin/true", &artifact).unwrap();
+    fn sign_args_omit_entitlements_when_unset() {
+        let args = Macos::sign_args(
+            Path::new("developer-id.p12"),
+            Path::new("developer-id.p12.password"),
+            None,
+            Path::new("target/tool"),
+        );
+        assert!(!args.iter().any(|arg| arg == "--entitlements-xml-file"));
+        assert_eq!(args.last().map(String::as_str), Some("target/tool"));
+    }
 
+    fn assert_preflight_errors(macos: &Macos, expected: &[&str]) {
+        let errors = macos.preflight_errors();
+        for expected in expected {
+            assert!(
+                errors.iter().any(|error| error == expected),
+                "missing {expected:?} in {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_preflight_reports_missing_credential_files() {
         let macos = Macos {
             codesign: Some(crate::config::Codesign {
-                identity: "-".to_string(),
+                p12_file: Some(PathBuf::from("missing/developer-id.p12")),
+                p12_env: None,
+                p12_password_file: Some(PathBuf::from("missing/developer-id.p12.password")),
+                p12_password_env: None,
+                entitlements: Some(PathBuf::from("missing/entitlements.plist")),
+            }),
+            notarization: Some(crate::config::Notarization {
+                api_key_file: Some(PathBuf::from("missing/app-store-connect-key.json")),
+                api_key_env: None,
+            }),
+        };
+
+        assert_preflight_errors(
+            &macos,
+            &[
+                "macos.codesign.p12-file not found: missing/developer-id.p12",
+                "macos.codesign.p12-password-file not found: missing/developer-id.p12.password",
+                "macos.codesign.entitlements file not found: missing/entitlements.plist",
+                "macos.notarization.api-key-file not found: missing/app-store-connect-key.json",
+            ],
+        );
+    }
+
+    #[test]
+    fn macos_preflight_reports_unset_secret_env_vars() {
+        let macos = Macos {
+            codesign: Some(crate::config::Codesign {
+                p12_file: None,
+                p12_env: Some("RELEASOR2000_TEST_UNSET_P12".to_string()),
+                p12_password_file: None,
+                p12_password_env: Some("RELEASOR2000_TEST_UNSET_P12_PASSWORD".to_string()),
                 entitlements: None,
             }),
-            notarization: None,
+            notarization: Some(crate::config::Notarization {
+                api_key_file: None,
+                api_key_env: Some("RELEASOR2000_TEST_UNSET_API_KEY".to_string()),
+            }),
         };
-        macos
-            .process_artifact(&artifact, &temp_dir, "tool-test-aarch64-apple-darwin")
-            .unwrap();
 
-        let archive = temp_dir.join("tool.tar.gz");
-        let archive_arg = archive.to_string_lossy();
-        run_cmd(
-            "test",
-            Some(&temp_dir),
-            "tar",
-            &["czf", &archive_arg, "tool"],
-        )
-        .unwrap();
-        let extracted_dir = temp_dir.join("extracted");
-        std::fs::create_dir(&extracted_dir).unwrap();
-        run_cmd("test", Some(&extracted_dir), "tar", &["xzf", &archive_arg]).unwrap();
+        assert_preflight_errors(
+            &macos,
+            &[
+                "RELEASOR2000_TEST_UNSET_P12 env var is required for macos.codesign.p12-env",
+                "RELEASOR2000_TEST_UNSET_P12_PASSWORD env var is required for macos.codesign.p12-password-env",
+                "RELEASOR2000_TEST_UNSET_API_KEY env var is required for macos.notarization.api-key-env",
+            ],
+        );
+    }
 
-        let status = Command::new("codesign")
-            .args(["--verify", "--strict", "--verbose=2"])
-            .arg(extracted_dir.join("tool"))
-            .status()
-            .unwrap();
-        std::fs::remove_dir_all(&temp_dir).unwrap();
-        assert!(status.success());
+    #[test]
+    fn macos_preflight_skips_unconfigured_signing() {
+        assert!(Macos::default().preflight_errors().is_empty());
+    }
+
+    #[test]
+    fn secret_dir_writes_env_secrets_and_removes_them_on_drop() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        unsafe {
+            // base64 of "p12data", wrapped across lines like GNU base64 output
+            std::env::set_var("RELEASOR2000_TEST_P12", "cDEy\nZGF0YQ==\n");
+            std::env::set_var("RELEASOR2000_TEST_P12_PASSWORD", "hunter2");
+        }
+
+        let secrets = SecretDir::create().unwrap();
+        let dir = secrets.0.clone();
+        let p12 = secrets.path(
+            Secret::Env {
+                key: "macos.codesign.p12",
+                var: "RELEASOR2000_TEST_P12",
+            },
+            "developer-id.p12",
+            true,
+        );
+        let p12_password = secrets.path(
+            Secret::Env {
+                key: "macos.codesign.p12-password",
+                var: "RELEASOR2000_TEST_P12_PASSWORD",
+            },
+            "developer-id.p12.password",
+            false,
+        );
+        let api_key = secrets.path(
+            Secret::File {
+                key: "macos.notarization.api-key",
+                path: Path::new("app-store-connect-key.json"),
+            },
+            "app-store-connect-key.json",
+            false,
+        );
+        unsafe {
+            std::env::remove_var("RELEASOR2000_TEST_P12");
+            std::env::remove_var("RELEASOR2000_TEST_P12_PASSWORD");
+        }
+
+        assert_eq!(std::fs::read(p12.unwrap()).unwrap(), b"p12data");
+        assert_eq!(
+            std::fs::read_to_string(p12_password.unwrap()).unwrap(),
+            "hunter2"
+        );
+        assert_eq!(api_key.unwrap(), Path::new("app-store-connect-key.json"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+
+        drop(secrets);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn secret_dir_requires_env_var() {
+        let secrets = SecretDir::create().unwrap();
+        let err = secrets
+            .path(
+                Secret::Env {
+                    key: "macos.notarization.api-key",
+                    var: "RELEASOR2000_TEST_UNSET_API_KEY",
+                },
+                "app-store-connect-key.json",
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "RELEASOR2000_TEST_UNSET_API_KEY env var is required for macos.notarization.api-key-env"
+        );
     }
 
     // --- preflight tests ---

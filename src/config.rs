@@ -50,16 +50,66 @@ pub struct Macos {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct Codesign {
-    pub identity: String,
+    pub p12_file: Option<PathBuf>,
+    pub p12_env: Option<String>,
+    pub p12_password_file: Option<PathBuf>,
+    pub p12_password_env: Option<String>,
     pub entitlements: Option<PathBuf>,
+}
+
+impl Codesign {
+    pub fn p12(&self) -> Result<Secret<'_>> {
+        Secret::from_config("macos.codesign.p12", &self.p12_file, &self.p12_env)
+    }
+
+    pub fn p12_password(&self) -> Result<Secret<'_>> {
+        Secret::from_config(
+            "macos.codesign.p12-password",
+            &self.p12_password_file,
+            &self.p12_password_env,
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Notarization {
-    #[serde(alias = "keychain_profile")]
-    pub keychain_profile: String,
+    pub api_key_file: Option<PathBuf>,
+    pub api_key_env: Option<String>,
+}
+
+impl Notarization {
+    pub fn api_key(&self) -> Result<Secret<'_>> {
+        Secret::from_config(
+            "macos.notarization.api-key",
+            &self.api_key_file,
+            &self.api_key_env,
+        )
+    }
+}
+
+/// A credential configured as either `<key>-file` (a path) or `<key>-env` (an env var holding its contents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Secret<'a> {
+    File { key: &'static str, path: &'a Path },
+    Env { key: &'static str, var: &'a str },
+}
+
+impl<'a> Secret<'a> {
+    fn from_config(
+        key: &'static str,
+        file: &'a Option<PathBuf>,
+        env: &'a Option<String>,
+    ) -> Result<Self> {
+        match (file, env) {
+            (Some(path), None) => Ok(Self::File { key, path }),
+            (None, Some(var)) => Ok(Self::Env { key, var }),
+            (Some(_), Some(_)) => bail!("{key}-file and {key}-env are mutually exclusive"),
+            (None, None) => bail!("{key}-file or {key}-env is required"),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -387,11 +437,16 @@ targets = [
 ]
 
 # [macos.codesign]
-# identity = "Developer ID Application: Example Corp (TEAMID)"
+# p12-file = "developer-id.p12"  # Developer ID Application certificate and private key
+# p12-password-file = "developer-id.p12.password"
 # entitlements = "entitlements.plist"  # optional
+# Or read secrets from env vars instead of files:
+# p12-env = "MACOS_P12_BASE64"  # base64 of the .p12
+# p12-password-env = "MACOS_P12_PASSWORD"
 
 # [macos.notarization]
-# keychain-profile = "releasor2000"  # created with: xcrun notarytool store-credentials releasor2000
+# api-key-file = "app-store-connect-key.json"  # created with: rcodesign encode-app-store-connect-api-key -o app-store-connect-key.json <issuer-id> <key-id> <AuthKey.p8>
+# api-key-env = "APP_STORE_CONNECT_KEY"  # or an env var holding that JSON
 
 [git]
 {git_settings}
@@ -467,11 +522,6 @@ const KEY_MIGRATIONS: &[KeyMigration] = &[
         table_path: &["channels", "nix"],
         dashed: "flake-repo",
         underscored: "flake_repo",
-    },
-    KeyMigration {
-        table_path: &["macos", "notarization"],
-        dashed: "keychain-profile",
-        underscored: "keychain_profile",
     },
 ];
 
@@ -607,24 +657,11 @@ impl Config {
             }
         }
         if let Some(codesign) = &self.macos.codesign {
-            if codesign.identity.trim().is_empty() {
-                bail!("macos.codesign.identity must not be empty");
-            }
-            if codesign
-                .entitlements
-                .as_ref()
-                .is_some_and(|path| path.to_string_lossy().trim().is_empty())
-            {
-                bail!("macos.codesign.entitlements must not be empty");
-            }
+            codesign.p12()?;
+            codesign.p12_password()?;
         }
-        if self
-            .macos
-            .notarization
-            .as_ref()
-            .is_some_and(|notarization| notarization.keychain_profile.trim().is_empty())
-        {
-            bail!("macos.notarization.keychain-profile must not be empty");
+        if let Some(notarization) = &self.macos.notarization {
+            notarization.api_key()?;
         }
         Ok(())
     }
@@ -920,29 +957,73 @@ targets = ["x86_64-apple-darwin"]
     #[test]
     fn parse_macos_codesign_and_notarization() {
         let toml = format!(
-            "{}\n[macos.codesign]\nidentity = \"Developer ID Application: Example Corp (TEAMID)\"\nentitlements = \"entitlements.plist\"\n\n[macos.notarization]\nkeychain-profile = \"release-profile\"\n",
+            "{}\n[macos.codesign]\np12-file = \"developer-id.p12\"\np12-password-file = \"developer-id.p12.password\"\nentitlements = \"entitlements.plist\"\n\n[macos.notarization]\napi-key-file = \"app-store-connect-key.json\"\n",
             minimal_toml()
         );
         let config = Config::parse(&toml).unwrap();
         let codesign = config.macos.codesign.unwrap();
         assert_eq!(
-            codesign.identity,
-            "Developer ID Application: Example Corp (TEAMID)"
+            codesign.p12().unwrap(),
+            Secret::File {
+                key: "macos.codesign.p12",
+                path: Path::new("developer-id.p12"),
+            }
+        );
+        assert_eq!(
+            codesign.p12_password().unwrap(),
+            Secret::File {
+                key: "macos.codesign.p12-password",
+                path: Path::new("developer-id.p12.password"),
+            }
         );
         assert_eq!(
             codesign.entitlements.as_deref(),
             Some(Path::new("entitlements.plist"))
         );
         assert_eq!(
-            config.macos.notarization.unwrap().keychain_profile,
-            "release-profile"
+            config.macos.notarization.unwrap().api_key().unwrap(),
+            Secret::File {
+                key: "macos.notarization.api-key",
+                path: Path::new("app-store-connect-key.json"),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_macos_secrets_from_env_vars() {
+        let toml = format!(
+            "{}\n[macos.codesign]\np12-env = \"MACOS_P12_BASE64\"\np12-password-env = \"MACOS_P12_PASSWORD\"\n\n[macos.notarization]\napi-key-env = \"APP_STORE_CONNECT_KEY\"\n",
+            minimal_toml()
+        );
+        let config = Config::parse(&toml).unwrap();
+        let codesign = config.macos.codesign.unwrap();
+        assert_eq!(
+            codesign.p12().unwrap(),
+            Secret::Env {
+                key: "macos.codesign.p12",
+                var: "MACOS_P12_BASE64",
+            }
+        );
+        assert_eq!(
+            codesign.p12_password().unwrap(),
+            Secret::Env {
+                key: "macos.codesign.p12-password",
+                var: "MACOS_P12_PASSWORD",
+            }
+        );
+        assert_eq!(
+            config.macos.notarization.unwrap().api_key().unwrap(),
+            Secret::Env {
+                key: "macos.notarization.api-key",
+                var: "APP_STORE_CONNECT_KEY",
+            }
         );
     }
 
     #[test]
     fn notarization_can_use_pre_signed_artifacts() {
         let toml = format!(
-            "{}\n[macos.notarization]\nkeychain-profile = \"release-profile\"\n",
+            "{}\n[macos.notarization]\napi-key-file = \"app-store-connect-key.json\"\n",
             minimal_toml()
         );
         let config = Config::parse(&toml).unwrap();
@@ -951,24 +1032,32 @@ targets = ["x86_64-apple-darwin"]
     }
 
     #[test]
-    fn macos_rejects_empty_credentials() {
-        let codesign_toml = format!("{}\n[macos.codesign]\nidentity = \"  \"\n", minimal_toml());
-        let codesign_err = Config::parse(&codesign_toml).unwrap_err();
-        assert!(
-            codesign_err
-                .to_string()
-                .contains("macos.codesign.identity must not be empty")
-        );
-
-        let notarization_toml = format!(
-            "{}\n[macos.notarization]\nkeychain-profile = \"  \"\n",
+    fn codesign_requires_p12_password_file_or_env() {
+        let toml = format!(
+            "{}\n[macos.codesign]\np12-file = \"developer-id.p12\"\n",
             minimal_toml()
         );
-        let notarization_err = Config::parse(&notarization_toml).unwrap_err();
+        let err = Config::parse(&toml).unwrap_err();
         assert!(
-            notarization_err
-                .to_string()
-                .contains("macos.notarization.keychain-profile must not be empty")
+            err.to_string().contains(
+                "macos.codesign.p12-password-file or macos.codesign.p12-password-env is required"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn macos_secret_rejects_both_file_and_env() {
+        let toml = format!(
+            "{}\n[macos.notarization]\napi-key-file = \"app-store-connect-key.json\"\napi-key-env = \"APP_STORE_CONNECT_KEY\"\n",
+            minimal_toml()
+        );
+        let err = Config::parse(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "macos.notarization.api-key-file and macos.notarization.api-key-env are mutually exclusive"
+            ),
+            "got: {err}"
         );
     }
 

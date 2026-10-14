@@ -94,11 +94,15 @@ targets = [
 ]
 
 # [macos.codesign]
-# identity = "Developer ID Application: Example Corp (TEAMID)"
+# p12-file = "developer-id.p12"
+# p12-password-file = "developer-id.p12.password"
 # entitlements = "entitlements.plist"  # optional
+# p12-env = "MACOS_P12_BASE64"           # instead of p12-file
+# p12-password-env = "MACOS_P12_PASSWORD"  # instead of p12-password-file
 
 # [macos.notarization]
-# keychain-profile = "releasor2000"
+# api-key-file = "app-store-connect-key.json"
+# api-key-env = "APP_STORE_CONNECT_KEY"  # instead of api-key-file
 
 [git]
 # type = "gitea"                  # defaults to "github"
@@ -161,26 +165,42 @@ When `auto-tag = true`, releasor2000 supports Rust packages and Cargo workspace 
 
 ### macOS code signing and notarization
 
-Both sections are optional and apply only to `apple-darwin` targets. Signing runs after the build and before the release archive is created.
+Both sections are optional and apply only to `apple-darwin` targets. Signing runs after the build and before the release archive is created. Both use [`rcodesign`](https://github.com/indygreg/apple-platform-rs/tree/main/apple-codesign), so signing and notarization work from Linux as well as macOS. Install it with `cargo install apple-codesign`.
 
 ```toml
 [macos.codesign]
-identity = "Developer ID Application: Example Corp (TEAMID)"
+p12-file = "developer-id.p12"
+p12-password-file = "developer-id.p12.password"
 entitlements = "entitlements.plist"  # optional
 
 [macos.notarization]
-keychain-profile = "releasor2000"
+api-key-file = "app-store-connect-key.json"
 ```
 
-Code signing uses `codesign` with the hardened runtime and a secure timestamp, then verifies the signature. The signing identity must be available in the build machine's keychain.
+Code signing runs `rcodesign sign` with the hardened runtime and a secure timestamp. `p12-file` is a Developer ID Application certificate and private key exported from Keychain Access, and `p12-password-file` holds its password on the first line.
 
-Notarization creates a temporary ZIP, submits it with `xcrun notarytool submit --wait`, and publishes the existing `.tar.gz` only after Apple accepts the submission. Configure the keychain profile once without storing credentials in the config:
+Notarization zips the binary, submits it with `rcodesign notary-submit --wait`, and publishes the existing `.tar.gz` only after Apple accepts the submission. A rejected submission fails the release and prints Apple's notarization log. `api-key-file` is an App Store Connect API key encoded once with:
 
 ```sh
-xcrun notarytool store-credentials releasor2000
+rcodesign encode-app-store-connect-api-key -o app-store-connect-key.json <issuer-id> <key-id> AuthKey_<key-id>.p8
 ```
 
-The `[macos.notarization]` section can also notarize pre-signed artifacts when `[macos.codesign]` is omitted. Releasor2000 verifies that those artifacts have a valid code signature before submission.
+All paths are relative to the directory releasor2000 runs in. Keep these files out of version control.
+
+In CI, each credential can come from an env var instead of a file by using the `-env` form of its key (`p12-env`, `p12-password-env`, `api-key-env`). Set exactly one of `-file` or `-env` per credential.
+
+```toml
+[macos.codesign]
+p12-env = "MACOS_P12_BASE64"            # base64 of the .p12: base64 < developer-id.p12
+p12-password-env = "MACOS_P12_PASSWORD"
+
+[macos.notarization]
+api-key-env = "APP_STORE_CONNECT_KEY"   # contents of app-store-connect-key.json
+```
+
+Releasor2000 writes env var secrets to a private temporary directory for `rcodesign` and deletes it after each artifact is processed.
+
+The `[macos.notarization]` section can also notarize pre-signed artifacts when `[macos.codesign]` is omitted. Apple rejects artifacts without a valid Developer ID signature.
 
 Apple creates an online ticket for standalone binaries, but does not support stapling tickets to them. Gatekeeper retrieves the ticket when the binary is first opened.
 
@@ -298,6 +318,7 @@ macOS targets can cross-compile between x86_64 and aarch64 natively on macOS. Bu
 - **cross** (optional) — fallback cross-compilation backend
 - **nix** (optional) — required only for the nix channel
 - **sftp** (optional) — required only for the curl channel with `dest`
-- **Xcode command-line tools** (optional) — `codesign` is required for macOS signing; Xcode 13 or later with `notarytool` is required for notarization
-- **Developer ID Application certificate** (optional) — required in the build machine's keychain for distributable macOS signatures
-- **notarytool keychain profile** (optional) — required when `[macos.notarization]` is configured
+- **rcodesign** (optional) — required for macOS signing and notarization; install with `cargo install apple-codesign`
+- **Developer ID Application certificate** (optional) — exported as a `.p12` for `[macos.codesign]`
+- **App Store Connect API key** (optional) — required when `[macos.notarization]` is configured
+- **zip** (optional) — required for macOS notarization
